@@ -3,9 +3,11 @@
 
   python3 build_firmware.py ../update.img out/update.img
   python3 build_firmware.py --adb-only ../update.img out/update-adb.img   # без мода, только ADB
+  --keep-oem  не прошивать oem (настройки программы, заставка сна) — только если на книге
+              уже эта же сборка; при переходе с другой сборки oem нужен из пакета
 
 Пакет повторяет официальный (uboot, boot, recovery, … из того же файла), отличается
-только rootfs, а разделы userdata (книги) и oem (настройки программы) из пакета убраны. Ядро и система
+только rootfs, а раздел userdata (книги) из пакета убран (с --keep-oem — и oem). Ядро и система
 гарантированно из одной сборки. Откат — официальный update.img тем же способом.
 
 Что меняется в rootfs:
@@ -28,8 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LUMA = os.path.join(HERE, "luma")
 ROOTFS_PART_BYTES = 0x46000 * 512  # из parameter.txt
 # всё как в официальном пакете, кроме userdata (книги; штатно он и так не прошивается)
-# и oem (настройки программы, заставка сна): прошивка его сбрасывает, а мод его не меняет
-DROP = ("userdata", "oem")
+DROP = ["userdata"]
 
 # ylc-ebook сборки 2026-06-26: malloc(512)/snprintf(...,512,...) для CSS -> 4096
 BIN_SHA256 = None  # проверяем по ожидаемым байтам ниже, а не по хешу файла
@@ -193,7 +194,11 @@ def main():
         return
     # --adb-only: официальная прошивка без мода, только с включённым ADB
     adb_only = "--adb-only" in sys.argv
-    args = [a for a in sys.argv[1:] if a != "--adb-only"]
+    # oem — настройки программы и заставка сна: прошивка их сбрасывает. Пропускать можно,
+    # только если на книге уже та же сборка: oem другой сборки может не подойти программе
+    if "--keep-oem" in sys.argv:
+        DROP.append("oem")
+    args = [a for a in sys.argv[1:] if a not in ("--adb-only", "--keep-oem")]
     if len(args) != 2:
         sys.exit(__doc__)
     src, dst = args
