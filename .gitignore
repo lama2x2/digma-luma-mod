@@ -1,0 +1,8 @@
+# не публикуем: прошивки и бэкап Digma, сборка, журналы
+backup/
+out/
+*.img
+luma/build/
+*.log
+__pycache__/
+.DS_Store
