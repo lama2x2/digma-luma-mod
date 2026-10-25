@@ -22,6 +22,7 @@
 #include <iconv.h>
 #ifdef __linux__
 #include <dirent.h>
+#include <limits.h>
 #include <link.h>
 #include <pthread.h>
 #endif
@@ -30,6 +31,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -132,6 +135,15 @@ static struct {
 	int text_anchor;    /* 1 = после смены размера, интервала, полей — страница с тем же текстом */
 	int text_panel;     /* 1 = пункт меню «Размер шрифта» открывает панель «Текст» с − / + */
 	char hide_fonts[512]; /* шрифты, которых нет в меню «Тип шрифта», через запятую */
+	/* чтение */
+	int stats;            /* 1 = вести статистику чтения (luma/stats.tsv) */
+	int progress_chapter; /* «до гл. 12» — сколько страниц до следующей главы */
+	int progress_time;    /* «~5 ч 20 мин» — сколько читать до конца по своей скорости */
+	int book_info;        /* 1 = пункт меню «О книге» показывает полное описание из fb2 */
+	int idle_ms;          /* простой: главный цикл спит до стольких мс, просыпаясь от касания и кнопок; 0 = как штатно */
+	char corner[4][16];   /* действие на тап в углу: tl tr bl br — none / info / panel */
+	int corner_size;      /* сторона угловой зоны, px */
+	int touch_log;        /* писать касания в журнал (отладка жестов) */
 } cfg;
 
 static void logf_(const char *fmt, ...)
@@ -297,6 +309,27 @@ static void ini_set(const char *sec, const char *key, char *val)
 			cfg.buttons_swap = atoi(val);
 		else if (!strcmp(key, "toggle"))
 			cfg.buttons_toggle = atoi(val);
+	} else if (!strcmp(sec, "reading")) {
+		if (!strcmp(key, "stats"))
+			cfg.stats = atoi(val);
+		else if (!strcmp(key, "chapter_left"))
+			cfg.progress_chapter = atoi(val);
+		else if (!strcmp(key, "time_left"))
+			cfg.progress_time = atoi(val);
+		else if (!strcmp(key, "book_info"))
+			cfg.book_info = atoi(val);
+	} else if (!strcmp(sec, "power")) {
+		if (!strcmp(key, "idle_sleep_ms"))
+			cfg.idle_ms = atoi(val);
+	} else if (!strcmp(sec, "gestures")) {
+		static const char *const names[4] = {"corner_top_left", "corner_top_right", "corner_bottom_left", "corner_bottom_right"};
+		for (int i = 0; i < 4; i++)
+			if (!strcmp(key, names[i]))
+				copy(cfg.corner[i], sizeof cfg.corner[i], val);
+		if (!strcmp(key, "corner_size"))
+			cfg.corner_size = atoi(val);
+		else if (!strcmp(key, "log"))
+			cfg.touch_log = atoi(val);
 	} else if (!strcmp(sec, "interface")) {
 		if (!strcmp(key, "menu_values"))
 			cfg.menu_values = atoi(val);
@@ -324,6 +357,13 @@ static void load_ini(void)
 	cfg.buttons_swap = cfg.buttons_toggle = cfg.text_global = cfg.sleep_cover = cfg.thumbs = cfg.sort_books = 1;
 	cfg.text_anchor = 1;
 	cfg.text_panel = 1;
+	cfg.stats = cfg.book_info = 1;
+	cfg.idle_ms = 1000;
+	copy(cfg.corner[0], sizeof cfg.corner[0], "info");
+	copy(cfg.corner[1], sizeof cfg.corner[1], "panel");
+	copy(cfg.corner[2], sizeof cfg.corner[2], "none");
+	copy(cfg.corner[3], sizeof cfg.corner[3], "none");
+	cfg.corner_size = 130;
 	/* без кириллицы и почти одинаковые с оставшимися (Arial ≈ Roboto, Tahoma ≈ Verdana,
 	   Noto Sans и Malgun ≈ Open Sans, Corbel ≈ Calibri) */
 	copy(cfg.hide_fonts, sizeof cfg.hide_fonts, "OpenDyslexicAlta, OpenDyslexicMono, Arial, Tahoma, Noto Sans, Malgun Gothic, Corbel");
@@ -561,6 +601,12 @@ static struct {
 	double lh_app;
 } css_last;
 static void *tune_item; /* подпись «Размер шрифта» в только что созданном меню читалки */
+static void *info_item, *info_label; /* подпись «О книге» там же: новая и та, на которой стоит обработчик */
+static void *info_menu; /* меню программы, спрятанное под «О книге» мода */
+static volatile int win_key; /* кнопка, пока открыто окно мода: 1 — закрыть, 2 — выше, 3 — ниже */
+/* экран читалки: там последний раз писался номер страницы; сколько у него детей без меню */
+static void *reader_scr;
+static uint32_t reader_kids;
 
 static void tune_save(void)
 {
@@ -1989,9 +2035,14 @@ static void battery(char *out, size_t n, const char *text)
 
 /* строка состояния: часы -> «часы  94%», «5/816» -> «5/816 · 1%» (только копируемые подписи).
    На главном экране справа от часов значок батареи — там процент пишется после даты. */
+static void stats_page(int page, int total);
+static void progress_tail(int page, int total, char *chap, size_t cn, char *left, size_t ln);
+
+#define STATUS_CHAR10 98 /* средняя ширина знака в строке состояния ×10, px (по снимку экрана) */
+
 static const char *status_text(void *obj, const char *text)
 {
-	static char buf[64], date[16];
+	static char buf[160], date[16];
 	static void *date_obj, *date_scr;
 	int h, m, y, n = 0, len = strlen(text);
 	if (cfg.status_battery && len == 10 && sscanf(text, "%2d-%2d-%4d%n", &h, &m, &y, &n) == 3 && n == len) {
@@ -2011,9 +2062,33 @@ static const char *status_text(void *obj, const char *text)
 		battery(buf, sizeof buf, text);
 		return buf;
 	}
-	if (cfg.status_progress && sscanf(text, "%d/%d%n", &h, &m, &n) == 2 && n == len && m > 0 && h <= m &&
+	if (sscanf(text, "%d/%d%n", &h, &m, &n) == 2 && n == len && m > 0 && h > 0 && h <= m &&
 	    m != 30 /* счётчик закладок «0/30» */) {
-		snprintf(buf, sizeof buf, "%s · %d%%", text, h * 100 / m);
+		stats_page(h, m);
+		if (lv.get_screen) {
+			uint32_t (*kids)(const void *) = dlsym(RTLD_DEFAULT, "lv_obj_get_child_count");
+			reader_scr = lv.get_screen(obj);
+			reader_kids = kids && reader_scr ? kids(reader_scr) : 0;
+		}
+		if (!cfg.status_progress)
+			return NULL;
+		/* подпись зажата между ярлыком с названием и часами: лишнее срезается слева,
+		   вместе с номером страницы. Хвост добавляем, только пока влезает */
+		int (*get_width)(const void *) = dlsym(RTLD_DEFAULT, "lv_obj_get_width");
+		int w = get_width ? get_width(obj) : 0;
+		if (w <= 0 || w > 400)
+			w = 200;
+		int fit = w * 10 / STATUS_CHAR10;
+		char chap[48], left[48];
+		progress_tail(h, m, chap, sizeof chap, left, sizeof left);
+		int o = snprintf(buf, sizeof buf, "%s · %d%%", text, h * 100 / m);
+		if (chap[0] && utf8_len(buf) + utf8_len(chap) <= fit)
+			o += snprintf(buf + o, sizeof buf - o, "%s", chap);
+		if (left[0] && utf8_len(buf) + utf8_len(left) <= fit)
+			snprintf(buf + o, sizeof buf - o, "%s", left);
+		static int logged;
+		if (cfg.debug > 1 && !logged++)
+			logf_("строка состояния: ширина %d, влезает %d знаков", w, fit);
 		return buf;
 	}
 	return NULL;
@@ -2065,6 +2140,10 @@ static const char *relabel(void *obj, const char *text, int dynamic)
 	if (cfg.text_panel && dynamic >= 0 && !strcmp(text, "Размер шрифта")) {
 		tune_item = obj;
 		return "Текст: размер, интервал";
+	}
+	if (cfg.book_info && dynamic >= 0 && !strcmp(text, "О книге")) {
+		info_item = obj;
+		return text;
 	}
 	if (cfg.menu_values && (r = menu_value(text)))
 		return r;
@@ -2497,20 +2576,141 @@ static fz_location my_lookup_bookmark(void *ctx, void *doc, intptr_t mark)
 /* разметка документа. Новый документ той же книги вскоре после закладки — это открытие
    заново после смены CSS (интервал, шрифт, панель): программа встанет на страницу с номером
    app+220, номер ставим по якорю — до того, как программа его прочтёт */
+/* начала глав из оглавления документа (страницы с 1, сквозные) — для «до гл. N».
+   Оглавление берём сразу после разметки, в том же потоке и с тем же ctx, что и программа */
+#define DOC_LOAD_OUTLINE 5
+struct outline {
+	int refs;
+	char *title, *uri;
+	int chapter, page;
+	float x, y;
+	struct outline *next, *down;
+	unsigned bits;
+};
+
+#define TOC_MAX 512
+static struct {
+	pthread_mutex_t mu;
+	int n;
+	int start[TOC_MAX];         /* первая страница главы (как в строке состояния, с 1) */
+	unsigned char level[TOC_MAX]; /* вложенность в оглавлении */
+	char title[TOC_MAX][80];
+} toc = {.mu = PTHREAD_MUTEX_INITIALIZER};
+
+struct toc_item {
+	int page, level;
+	char title[80];
+};
+
+/* название главы одной строкой, обрезка по целой букве */
+static void toc_title(char *dst, size_t n, const char *src)
+{
+	size_t o = 0;
+	int space = 1;
+	for (const unsigned char *p = (const unsigned char *)(src ? src : ""); *p && o + 1 < n; p++) {
+		int sp = *p <= ' ';
+		if (sp && space)
+			continue;
+		dst[o++] = sp ? ' ' : *p;
+		space = sp;
+	}
+	/* обрезали посреди буквы — убрать её начало */
+	size_t k = o;
+	while (k && (dst[k - 1] & 0xc0) == 0x80)
+		k--;
+	if (k && (unsigned char)dst[k - 1] >= 0xc0) {
+		unsigned char lead = dst[k - 1];
+		size_t need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
+		if (o - (k - 1) < need)
+			o = k - 1;
+	}
+	while (o && dst[o - 1] == ' ')
+		o--;
+	dst[o] = 0;
+}
+
+/* как fz_drop_outline: у html-документа оглавление общее (doc->outline), load_outline
+   только прибавляет ссылку, освобождать можно лишь последнюю */
+static void outline_free(struct outline *o)
+{
+	/* MuPDF создан без своего распределителя (fz_new_context(NULL, ...)) — это обычный malloc */
+	while (o && __atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL) == 0) {
+		struct outline *next = o->next;
+		outline_free(o->down);
+		free(o->title);
+		free(o->uri);
+		free(o);
+		o = next;
+	}
+}
+
+static void toc_walk(void *ctx, void *doc, struct outline *o, struct toc_item *out, int *n, int depth)
+{
+	for (; o && *n < TOC_MAX; o = o->next) {
+		if (o->chapter >= 0 && o->page >= 0) {
+			int flat = o->page;
+			for (int c = 0; c < o->chapter; c++)
+				flat += chapter_pages(ctx, doc, c);
+			struct toc_item *t = &out[(*n)++];
+			t->page = flat + 1;
+			t->level = depth;
+			toc_title(t->title, sizeof t->title, o->title);
+		}
+		if (depth < 8)
+			toc_walk(ctx, doc, o->down, out, n, depth + 1);
+	}
+}
+
+static void toc_update(void *ctx, void *doc)
+{
+	struct outline *(*load)(void *, void *) = ((void **)doc)[DOC_LOAD_OUTLINE];
+	if (!load)
+		return;
+	struct toc_item *st = malloc(TOC_MAX * sizeof *st);
+	if (!st)
+		return;
+	struct outline *o = load(ctx, doc);
+	int n = 0;
+	toc_walk(ctx, doc, o, st, &n, 0);
+	outline_free(o);
+	/* по возрастанию страниц (порядок внутри страницы сохраняется), на странице — первая глава */
+	for (int i = 1; i < n; i++)
+		for (int j = i; j > 0 && st[j - 1].page > st[j].page; j--) {
+			struct toc_item t = st[j];
+			st[j] = st[j - 1];
+			st[j - 1] = t;
+		}
+	int k = 0;
+	for (int i = 0; i < n; i++)
+		if (!k || st[i].page != st[k - 1].page)
+			st[k++] = st[i];
+	pthread_mutex_lock(&toc.mu);
+	for (int i = 0; i < k; i++) {
+		toc.start[i] = st[i].page;
+		toc.level[i] = st[i].level;
+		memcpy(toc.title[i], st[i].title, sizeof toc.title[i]);
+	}
+	toc.n = k;
+	pthread_mutex_unlock(&toc.mu);
+	if (cfg.debug > 1)
+		logf_("главы: %d, первые %d %d %d", k, k > 0 ? st[0].page : 0, k > 1 ? st[1].page : 0, k > 2 ? st[2].page : 0);
+	free(st);
+}
+
 static void my_layout(void *ctx, void *doc, float w, float h, float em)
 {
 	static __thread int inside;
 	/* только что открытый документ ещё не размечен; адрес у него может совпасть со старым */
 	int fresh = !((int *)doc)[DOC_DID_LAYOUT];
 	((void (*)(void *, void *, float, float, float))(rd.base + HT_LAYOUT_VA))(ctx, doc, w, h, em);
-	if (!cfg.text_anchor || !rd.app || !*rd.app || inside)
+	if ((!cfg.text_anchor && !cfg.progress_chapter && !cfg.book_info) || !rd.app || !*rd.app || inside)
 		return;
 	/* fz_layout_document отметит разметку только после нас: без отметки подсчёт страниц
 	   запустил бы разметку заново (и снова нас) */
 	((int *)doc)[DOC_DID_LAYOUT] = 1;
 	inside = 1;
 	pthread_mutex_lock(&anc.mu);
-	if (fresh && anc.alen && anc.doc && anc.book == book_opens && since_ms(&anc.made) < 10000) {
+	if (cfg.text_anchor && fresh && anc.alen && anc.doc && anc.book == book_opens && since_ms(&anc.made) < 10000) {
 		int count = chapter_pages(ctx, doc, anc.ach), to = -1;
 		int est = (int)(anc.mfrac * count + 0.5);
 		if (count > 0 && find_anchor(ctx, doc, est, count, &to)) {
@@ -2529,6 +2729,8 @@ static void my_layout(void *ctx, void *doc, float w, float h, float em)
 		anc.pending = 0;
 	}
 	pthread_mutex_unlock(&anc.mu);
+	if (cfg.progress_chapter || cfg.book_info)
+		toc_update(ctx, doc);
 	inside = 0;
 }
 
@@ -2707,6 +2909,9 @@ static void panel_close(void)
 	panel.menu = NULL;
 }
 
+static void info_open(void);
+static int info_is_open(void);
+
 static void panel_button_cb(void *e)
 {
 	intptr_t a = (intptr_t)ui.ev_user(e);
@@ -2725,6 +2930,11 @@ static void panel_button_cb(void *e)
 	}
 	if (a == 102) {
 		panel_close();
+		return;
+	}
+	if (a == 103) {
+		panel_close();
+		info_open();
 		return;
 	}
 	int row = a / 2, dir = a % 2 ? 1 : -1;
@@ -2761,7 +2971,7 @@ static void *ui_button(void *parent, int x, int y, int w, int h, const char *tex
 	ui.border_color(b, BLACK, 0);
 	ui.border_width(b, 2, 0);
 	ui.radius(b, 10, 0);
-	void *l = ui_label(b, text, panel.font_big);
+	void *l = ui_label(b, text, act >= 101 ? panel.font : panel.font_big);
 	ui.center(l);
 	ui.add_event_cb(b, panel_button_cb, LV_EVENT_CLICKED, (void *)act);
 	return b;
@@ -2825,8 +3035,10 @@ static void panel_open(void)
 		ui_button(p, x_plus, y + 6, bw, rowh - 16, "+", i * 2 + 1);
 	}
 	int y = 20 + TUNE_ROWS * rowh;
-	ui_button(p, 24, y + 6, (W - 72) / 2, rowh - 16, "Как в ini", 101);
-	ui_button(p, 48 + (W - 72) / 2, y + 6, (W - 72) / 2, rowh - 16, "Готово", 102);
+	int bw3 = (W - 24 * 4) / 3;
+	ui_button(p, 24, y + 6, bw3, rowh - 16, "Как в ini", 101);
+	ui_button(p, 24 * 2 + bw3, y + 6, bw3, rowh - 16, "О книге", 103);
+	ui_button(p, 24 * 3 + bw3 * 2, y + 6, bw3, rowh - 16, "Готово", 102);
 	logf_("панель: открыта");
 }
 
@@ -2853,17 +3065,26 @@ static void item_cb(void *e)
 	for (void *o = label; o && lv.parent(o); o = lv.parent(o))
 		if (ui.child_count(lv.parent(o)) > 1)
 			menu = o;
-	if (menu && menu != lv.get_screen(label) && ui.child_count(lv.get_screen(label)) > 1) {
+	if (!menu || menu == lv.get_screen(label) || ui.child_count(lv.get_screen(label)) <= 1)
+		menu = NULL;
+	if (label == info_label) {
+		/* вместо штатного окошка из четырёх строк — полное описание */
+		info_open();
+		if (info_is_open() && menu) {
+			ui.add_flag(menu, LV_FLAG_HIDDEN);
+			info_menu = menu;
+		}
+		return;
+	}
+	if (menu) {
 		ui.add_flag(menu, LV_FLAG_HIDDEN);
 		panel.menu = menu;
 	}
 	panel_open();
 }
 
-static void item_hook(void)
+static void item_hook(void *label)
 {
-	void *label = tune_item;
-	tune_item = NULL;
 	if (!ui_init() || !lv.is_valid(label))
 		return;
 	void *h = label;
@@ -2958,8 +3179,11 @@ static void panel_tick(void)
 			unlink("/dev/shm/luma-test/cmd");
 		}
 	}
-	if (tune_item)
-		item_hook();
+	if (tune_item) {
+		void *l = tune_item;
+		tune_item = NULL;
+		item_hook(l);
+	}
 	if (panel.dirty && since_ms(&panel.changed) > 700 && since_ms(&panel.applied) > 2500) {
 		if (!reader_init() || !*rd.app)
 			return;
@@ -2972,6 +3196,1533 @@ static void panel_tick(void)
 	}
 }
 
+/* ---------- чтение: статистика, «до гл. N», «О книге», касания, простой ---------- */
+
+static int active;           /* мод работает только в ylc-ebook */
+static unsigned char key_fd[256]; /* 0 — не смотрели, 1 — кнопки, 2 — другое, 3 — сенсор */
+static char cur_book[512];   /* открытая книга (по времени открытия в базе) */
+static struct timespec last_input, last_flush;
+static int wake_fd = -1;     /* будит главный цикл из других потоков */
+static pthread_t main_thread;
+static int main_known;
+
+static void wake_main(void)
+{
+	if (wake_fd >= 0) {
+		uint64_t one = 1;
+		ssize_t r = write(wake_fd, &one, sizeof one);
+		(void)r;
+	}
+}
+
+/* статистика: строка на кусок чтения — день, секунды, страницы, книга (luma/stats.tsv) */
+#define STATS_PATH LUMA_DIR "/stats.tsv"
+
+static struct {
+	char book[512], day[12];
+	double secs; /* ещё не записанное */
+	int pages;
+	int page, total;      /* последняя показанная страница */
+	struct timespec turn; /* когда её показали */
+	int has;
+	/* с учётом файла — для скорости */
+	char sum_book[512];
+	double book_secs, all_secs;
+	int book_pages, all_pages;
+} st;
+
+struct ssum {
+	double secs;
+	int pages, days;
+	char first[12], last[12];
+	double today_secs;
+	int today_pages;
+};
+
+static void today(char *d, size_t n)
+{
+	time_t t = time(NULL);
+	struct tm tm;
+	localtime_r(&t, &tm);
+	strftime(d, n, "%Y-%m-%d", &tm);
+}
+
+static void stats_flush(void)
+{
+	if (!st.book[0] || (st.pages <= 0 && st.secs < 1))
+		return;
+	FILE *f = fopen(STATS_PATH, "a");
+	if (f) {
+		fprintf(f, "%s\t%.0f\t%d\t%s\n", st.day, st.secs, st.pages, st.book);
+		fclose(f);
+	}
+	if (cfg.debug > 1)
+		logf_("статистика: %.0f с, %d стр — %s", st.secs, st.pages, st.book);
+	st.secs = 0;
+	st.pages = 0;
+}
+
+static void ssum_add(struct ssum *s, const char *day, double secs, int pages)
+{
+	s->secs += secs;
+	s->pages += pages;
+	if (strcmp(day, s->last))
+		s->days++;
+	if (!s->first[0])
+		copy(s->first, sizeof s->first, day);
+	copy(s->last, sizeof s->last, day);
+}
+
+static void stats_read(const char *book, struct ssum *b, struct ssum *all)
+{
+	memset(b, 0, sizeof *b);
+	memset(all, 0, sizeof *all);
+	FILE *f = fopen(STATS_PATH, "r");
+	if (!f)
+		return;
+	char now[12];
+	today(now, sizeof now);
+	char line[700];
+	while (fgets(line, sizeof line, f)) {
+		char day[12];
+		double secs;
+		int pages, off = 0;
+		if (sscanf(line, "%11[^\t]\t%lf\t%d\t%n", day, &secs, &pages, &off) < 3 || !off)
+			continue;
+		char *bk = line + off;
+		bk[strcspn(bk, "\n")] = 0;
+		int is_today = !strcmp(day, now);
+		ssum_add(all, day, secs, pages);
+		all->today_secs += is_today ? secs : 0;
+		all->today_pages += is_today ? pages : 0;
+		if (book && !strcmp(bk, book)) {
+			ssum_add(b, day, secs, pages);
+			b->today_secs += is_today ? secs : 0;
+			b->today_pages += is_today ? pages : 0;
+		}
+	}
+	fclose(f);
+}
+
+static double stats_spp(void)
+{
+	if (st.book_pages >= 20)
+		return st.book_secs / st.book_pages;
+	if (st.all_pages >= 20)
+		return st.all_secs / st.all_pages;
+	return 60;
+}
+
+/* показана страница page из total: время между перелистываниями — время чтения
+   (больше 5 мин на страницу не считаем, после 15 мин — перерыв) */
+static void stats_page(int page, int total)
+{
+	if (!cfg.stats || !active || !cur_book[0])
+		return;
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	char day[12];
+	today(day, sizeof day);
+	if (strcmp(st.book, cur_book) || strcmp(st.day, day)) {
+		stats_flush();
+		copy(st.day, sizeof st.day, day);
+		copy(st.book, sizeof st.book, cur_book);
+		st.has = 0;
+		if (strcmp(st.sum_book, cur_book)) {
+			struct ssum b, a;
+			stats_read(cur_book, &b, &a);
+			copy(st.sum_book, sizeof st.sum_book, cur_book);
+			st.book_secs = b.secs;
+			st.book_pages = b.pages;
+			st.all_secs = a.secs;
+			st.all_pages = a.pages;
+		}
+	}
+	if (st.has && total == st.total && page != st.page) {
+		int d = abs(page - st.page);
+		double dt = since_ms(&st.turn) / 1000;
+		if (d <= 2 && dt >= 5 && dt < 900) {
+			double c = dt > 300 ? 300 : dt;
+			st.secs += c;
+			st.pages += d;
+			st.book_secs += c;
+			st.book_pages += d;
+			st.all_secs += c;
+			st.all_pages += d;
+			if (st.pages >= 20)
+				stats_flush();
+		}
+	}
+	if (!st.has || page != st.page || total != st.total) {
+		st.page = page;
+		st.total = total;
+		st.turn = now;
+		st.has = 1;
+	}
+}
+
+static void fmt_minutes(char *out, size_t n, int min)
+{
+	if (min >= 60)
+		snprintf(out, n, "%d ч %d мин", min / 60, min % 60);
+	else
+		snprintf(out, n, "%d мин", min < 1 ? 1 : min);
+}
+
+/* хвост строки «5/816 · 1%»: до следующей главы и сколько читать до конца */
+static void progress_tail(int page, int total, char *chap, size_t cn, char *left, size_t ln)
+{
+	chap[0] = left[0] = 0;
+	if (cfg.progress_chapter) {
+		int next = 0, k;
+		pthread_mutex_lock(&toc.mu);
+		k = toc.n;
+		for (int i = 0; i < toc.n; i++)
+			if (toc.start[i] > page) {
+				next = toc.start[i];
+				break;
+			}
+		pthread_mutex_unlock(&toc.mu);
+		if (k > 1) {
+			if (!next)
+				next = total + 1;
+			snprintf(chap, cn, " · до гл. %d", next - page);
+		}
+	}
+	if (cfg.progress_time && cfg.stats && total > page) {
+		char t[32];
+		fmt_minutes(t, sizeof t, (int)((total - page) * stats_spp() / 60 + 0.5));
+		snprintf(left, ln, " · %s", t);
+	}
+}
+
+/* ---------- «О книге» ---------- */
+
+static void info_add(char *out, size_t n, size_t *o, const char *name, const char *val)
+{
+	if (!val || !val[0] || *o + 8 >= n)
+		return;
+	*o += snprintf(out + *o, n - *o, "%s%s%s\n", name, name[0] ? ": " : "", val);
+}
+
+/* все <tag> подряд: люди (author, translator) — «Имя Отчество Фамилия» через запятую, прочее — как есть */
+static void xml_all(const char *x, const char *tag, int person, char *out, size_t n)
+{
+	size_t o = 0;
+	out[0] = 0;
+	char open1[48], close1[48];
+	snprintf(open1, sizeof open1, "<%s", tag);
+	snprintf(close1, sizeof close1, "</%s>", tag);
+	for (const char *p = x; (p = strstr(p, open1)); p++) {
+		char c = p[strlen(open1)];
+		if (c != '>' && c != ' ')
+			continue;
+		const char *e = strstr(p, close1);
+		if (!e)
+			break;
+		char piece[2048], one[400] = "";
+		size_t pl = (size_t)(e - p) + strlen(close1);
+		if (pl >= sizeof piece)
+			pl = sizeof piece - 1;
+		memcpy(piece, p, pl);
+		piece[pl] = 0;
+		if (person) {
+			char first[128] = "", middle[128] = "", last[128] = "";
+			xml_text(piece, "first-name", first, sizeof first, NULL);
+			xml_text(piece, "middle-name", middle, sizeof middle, NULL);
+			xml_text(piece, "last-name", last, sizeof last, NULL);
+			if (!first[0] && !last[0])
+				xml_text(piece, "nickname", last, sizeof last, NULL);
+			format_author("full", first, middle, last, one, sizeof one);
+		} else
+			xml_text(piece, tag, one, sizeof one, NULL);
+		if (one[0] && o + strlen(one) + 3 < n)
+			o += snprintf(out + o, n - o, "%s%s", o ? ", " : "", one);
+		p = e;
+	}
+}
+
+/* аннотация с абзацами: xml_text склеивает всё в строку, поэтому отмечаем концы </p> */
+static void xml_para(const char *x, const char *tag, char *out, size_t n)
+{
+	out[0] = 0;
+	char open1[48], close1[48];
+	snprintf(open1, sizeof open1, "<%s>", tag);
+	snprintf(close1, sizeof close1, "</%s>", tag);
+	const char *s = strstr(x, open1), *e = s ? strstr(s, close1) : NULL;
+	if (!s || !e)
+		return;
+	size_t len = (size_t)(e - s) + strlen(close1);
+	char *tmp = malloc(len * 2 + 1);
+	if (!tmp)
+		return;
+	size_t o = 0;
+	for (size_t i = 0; i < len; i++) {
+		tmp[o++] = s[i];
+		if (s[i] == '>' && i >= 3 && !strncmp(s + i - 3, "</p>", 4))
+			tmp[o++] = '\x01';
+	}
+	tmp[o] = 0;
+	xml_text(tmp, tag, out, n, NULL);
+	free(tmp);
+	/* \x01 -> перевод строки, пробелы вокруг него долой */
+	char *w = out;
+	for (char *r = out; *r; r++) {
+		if (*r == '\x01') {
+			while (w > out && w[-1] == ' ')
+				w--;
+			*w++ = '\n';
+			while (r[1] == ' ')
+				r++;
+		} else
+			*w++ = *r;
+	}
+	while (w > out && (w[-1] == '\n' || w[-1] == ' '))
+		w--;
+	*w = 0;
+}
+
+/* ---------- статистика по дням и книгам: для окна «О книге» ---------- */
+
+/* номер дня от 1970-01-01 (алгоритм Хиннанта) и обратно */
+static long day_num(const char *d)
+{
+	int y, m, dd;
+	if (sscanf(d, "%d-%d-%d", &y, &m, &dd) != 3)
+		return 0;
+	y -= m <= 2;
+	long era = (y >= 0 ? y : y - 399) / 400;
+	long yoe = y - era * 400;
+	long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + dd - 1;
+	long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	return era * 146097 + doe - 719468;
+}
+
+static void day_civil(long z, int *y, int *m, int *d)
+{
+	z += 719468;
+	long era = (z >= 0 ? z : z - 146096) / 146097;
+	long doe = z - era * 146097;
+	long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	long mp = (5 * doy + 2) / 153;
+	*d = doy - (153 * mp + 2) / 5 + 1;
+	*m = mp < 10 ? mp + 3 : mp - 9;
+	*y = yoe + era * 400 + (*m <= 2);
+}
+
+static const char *const wday_ru[7] = {"пн", "вт", "ср", "чт", "пт", "сб", "вс"};
+static const char *const mon_gen[12] = {"янв.", "февр.", "марта", "апр.", "мая", "июня",
+					"июля", "авг.", "сент.", "окт.", "нояб.", "дек."};
+static const char *const mon_nom[12] = {"Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+					"Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"};
+
+/* 25.10 */
+static const char *short_date(long dn, char *out, size_t n)
+{
+	int y, m, d;
+	day_civil(dn, &y, &m, &d);
+	snprintf(out, n, "%02d.%02d", d, m);
+	return out;
+}
+
+struct sday {
+	long dn;
+	double secs;
+	int pages;
+};
+
+struct sbook {
+	char path[512];
+	double secs;
+	int pages;
+	long last;
+	int in_mon, in_year;
+};
+
+#define AGG_DAYS 2000
+#define AGG_BOOKS 256
+
+static struct sagg {
+	struct sday all[AGG_DAYS], book[AGG_DAYS];
+	int nall, nbook;
+	struct sbook books[AGG_BOOKS];
+	int nbooks;
+	long today;
+} *agg;
+
+static void sday_add(struct sday *a, int *n, long dn, double secs, int pages)
+{
+	if (*n && a[*n - 1].dn == dn) {
+		a[*n - 1].secs += secs;
+		a[*n - 1].pages += pages;
+		return;
+	}
+	/* строки дописываются по порядку; если вдруг нет — ищем назад */
+	for (int i = *n - 1; i >= 0 && i >= *n - 8; i--)
+		if (a[i].dn == dn) {
+			a[i].secs += secs;
+			a[i].pages += pages;
+			return;
+		}
+	if (*n >= AGG_DAYS)
+		return;
+	a[*n] = (struct sday){dn, secs, pages};
+	(*n)++;
+}
+
+/* прочитать stats.tsv целиком; book — открытая книга (по ней отдельный список дней) */
+static struct sagg *stats_agg(const char *book)
+{
+	if (!agg && !(agg = malloc(sizeof *agg)))
+		return NULL;
+	memset(agg, 0, sizeof *agg);
+	char now[12];
+	today(now, sizeof now);
+	agg->today = day_num(now);
+	int ty, tm, td;
+	day_civil(agg->today, &ty, &tm, &td);
+	stats_flush();
+	FILE *f = fopen(STATS_PATH, "r");
+	if (!f)
+		return agg;
+	char line[700];
+	while (fgets(line, sizeof line, f)) {
+		char day[12];
+		double secs;
+		int pages, off = 0;
+		if (sscanf(line, "%11[^\t]\t%lf\t%d\t%n", day, &secs, &pages, &off) < 3 || !off)
+			continue;
+		char *bk = line + off;
+		bk[strcspn(bk, "\n")] = 0;
+		long dn = day_num(day);
+		if (!dn)
+			continue;
+		sday_add(agg->all, &agg->nall, dn, secs, pages);
+		if (book && !strcmp(bk, book))
+			sday_add(agg->book, &agg->nbook, dn, secs, pages);
+		struct sbook *b = NULL;
+		for (int i = 0; i < agg->nbooks && !b; i++)
+			if (!strcmp(agg->books[i].path, bk))
+				b = &agg->books[i];
+		if (!b && agg->nbooks < AGG_BOOKS) {
+			b = &agg->books[agg->nbooks++];
+			copy(b->path, sizeof b->path, bk);
+		}
+		if (b) {
+			int y, m, d;
+			day_civil(dn, &y, &m, &d);
+			b->secs += secs;
+			b->pages += pages;
+			b->last = dn;
+			b->in_year |= y == ty;
+			b->in_mon |= y == ty && m == tm;
+		}
+	}
+	fclose(f);
+	return agg;
+}
+
+struct ssum2 {
+	double secs;
+	int pages, days;
+	long first, best_dn;
+	double best;
+};
+
+static struct ssum2 sum_days(const struct sday *a, int n, long from, long to)
+{
+	struct ssum2 s = {0};
+	for (int i = 0; i < n; i++) {
+		if (a[i].dn < from || a[i].dn > to)
+			continue;
+		s.secs += a[i].secs;
+		s.pages += a[i].pages;
+		s.days++;
+		if (!s.first)
+			s.first = a[i].dn;
+		if (a[i].secs > s.best) {
+			s.best = a[i].secs;
+			s.best_dn = a[i].dn;
+		}
+	}
+	return s;
+}
+
+/* серия дней подряд: текущая (если читал сегодня или вчера) и самая длинная */
+static void streaks(const struct sday *a, int n, long today_dn, int *cur, int *best)
+{
+	*cur = *best = 0;
+	int run = 0;
+	long prev = 0;
+	for (int i = 0; i < n; i++) {
+		if (a[i].secs <= 0)
+			continue;
+		run = prev && a[i].dn == prev + 1 ? run + 1 : a[i].dn == prev ? run : 1;
+		prev = a[i].dn;
+		if (run > *best)
+			*best = run;
+	}
+	*cur = prev && today_dn - prev <= 1 ? run : 0;
+}
+
+static double day_secs(const struct sday *a, int n, long dn)
+{
+	for (int i = n - 1; i >= 0; i--)
+		if (a[i].dn == dn)
+			return a[i].secs;
+	return 0;
+}
+
+static void fmt_secs(char *out, size_t n, double secs)
+{
+	fmt_minutes(out, n, (int)(secs / 60 + 0.5));
+}
+
+/* вкладка «Чтение»: где ты, сколько осталось, сколько уже прочитал */
+static void reading_text(const char *path, struct sagg *g, char *out, size_t n, char *out2, size_t n2)
+{
+	size_t o = 0, o2 = 0;
+	out[0] = out2[0] = 0;
+	int here = st.has && !strcmp(st.book, path) && st.total > 0;
+	struct ssum2 b = sum_days(g->book, g->nbook, 0, LONG_MAX);
+	struct ssum2 a = sum_days(g->all, g->nall, 0, LONG_MAX);
+	double spp = stats_spp();
+	char t[48], t2[48], d1[16];
+	if (here) {
+		o += snprintf(out + o, n - o, "Стр. %d из %d · %d%%\n", st.page, st.total, st.page * 100 / st.total);
+		int next = 0, cur = 0, k;
+		pthread_mutex_lock(&toc.mu);
+		k = toc.n;
+		for (int i = 0; i < toc.n; i++) {
+			if (toc.start[i] <= st.page)
+				cur = i + 1;
+			else if (!next)
+				next = toc.start[i];
+		}
+		pthread_mutex_unlock(&toc.mu);
+		if (k > 1) {
+			if (!next)
+				next = st.total + 1;
+			int left = next - st.page;
+			o += snprintf(out + o, n - o, "Глава %d из %d · до следующей %d стр.", cur ? cur : 1, k, left);
+			if (a.pages > 0) {
+				fmt_secs(t, sizeof t, left * spp);
+				o += snprintf(out + o, n - o, " · ~%s", t);
+			}
+			o += snprintf(out + o, n - o, "\n");
+		}
+		if (st.total > st.page && a.pages > 0) {
+			double rest = (st.total - st.page) * spp;
+			fmt_secs(t, sizeof t, rest);
+			o += snprintf(out + o, n - o, "Осталось ~%s", t);
+			/* темп: по этой книге, если читал её хотя бы два дня, иначе по всем книгам за 2 недели */
+			struct ssum2 w = sum_days(g->all, g->nall, g->today - 13, g->today);
+			double pace = b.days >= 2 ? b.secs / b.days : w.days ? w.secs / w.days : 0;
+			if (pace >= 60) {
+				long dn = g->today + (long)ceil(rest / pace) - (day_secs(g->all, g->nall, g->today) > 0 ? 1 : 0);
+				if (dn < g->today)
+					dn = g->today;
+				int y, m, d;
+				day_civil(dn, &y, &m, &d);
+				fmt_secs(t2, sizeof t2, pace);
+				if (dn == g->today)
+					o += snprintf(out + o, n - o, " · дочитаешь сегодня");
+				else
+					o += snprintf(out + o, n - o, " · дочитаешь ≈ %d %s (по %s в день)", d, mon_gen[m - 1], t2);
+			}
+			o += snprintf(out + o, n - o, "\n");
+		}
+	}
+	if (b.pages > 0) {
+		fmt_secs(t, sizeof t, b.secs);
+		o += snprintf(out + o, n - o, "\nЭта книга: %s · %d стр.", t, b.pages);
+		if (b.secs > 120)
+			o += snprintf(out + o, n - o, " · %.0f стр./ч", b.pages * 3600.0 / b.secs);
+		o += snprintf(out + o, n - o, "\nДней чтения: %d, с %s", b.days, short_date(b.first, d1, sizeof d1));
+		double tb = day_secs(g->book, g->nbook, g->today);
+		if (tb > 0) {
+			fmt_secs(t, sizeof t, tb);
+			o += snprintf(out + o, n - o, " · сегодня %s", t);
+		}
+		if (b.days > 1) {
+			fmt_secs(t, sizeof t, b.best);
+			o += snprintf(out + o, n - o, "\nЛучший день: %s — %s", short_date(b.best_dn, d1, sizeof d1), t);
+		}
+		o += snprintf(out + o, n - o, "\n");
+	} else
+		o += snprintf(out + o, n - o, "\nСтатистика по этой книге копится, пока читаешь.\n");
+	if (a.pages > 0) {
+		int cur, best;
+		streaks(g->all, g->nall, g->today, &cur, &best);
+		o2 += snprintf(out2 + o2, n2 - o2, "Подряд: %d дн.", cur);
+		if (best > cur)
+			o2 += snprintf(out2 + o2, n2 - o2, " · рекорд %d дн.", best);
+		fmt_secs(t, sizeof t, a.best);
+		o2 += snprintf(out2 + o2, n2 - o2, "\nЛучший день по всем книгам: %s — %s", short_date(a.best_dn, d1, sizeof d1), t);
+		struct ssum2 w = sum_days(g->all, g->nall, g->today - 6, g->today);
+		fmt_secs(t, sizeof t, w.secs);
+		fmt_secs(t2, sizeof t2, w.days ? w.secs / 7 : 0);
+		o2 += snprintf(out2 + o2, n2 - o2, "\nЗа 7 дней: %s · %d стр. · ~%s в день\n", t, w.pages, t2);
+	}
+}
+
+/* название книги из кэша библиотеки: «Автор — Название» */
+static int cache_title(const char *path, char *author, size_t an, char *title, size_t tn, char *series, size_t sn, char *num, size_t nn)
+{
+	author[0] = title[0] = 0;
+	if (series)
+		series[0] = 0;
+	if (num)
+		num[0] = 0;
+	FILE *f = fopen(CACHE_PATH, "r");
+	if (!f)
+		return 0;
+	char line[2048];
+	int found = 0;
+	size_t pl = strlen(path);
+	while (!found && fgets(line, sizeof line, f)) {
+		if (strncmp(line, path, pl) || line[pl] != '\t')
+			continue;
+		line[strcspn(line, "\n")] = 0;
+		char *fld[4] = {line + pl + 1};
+		for (int k = 1; k < 4 && fld[k - 1]; k++) {
+			char *t = strchr(fld[k - 1], '\t');
+			if (t)
+				*t = 0;
+			fld[k] = t ? t + 1 : NULL;
+		}
+		copy(author, an, fld[0]);
+		copy(title, tn, fld[1] ? fld[1] : "");
+		if (series)
+			copy(series, sn, fld[2] ? fld[2] : "");
+		if (num)
+			copy(num, nn, fld[3] ? fld[3] : "");
+		found = 1;
+	}
+	fclose(f);
+	return found && title[0];
+}
+
+/* другие книги той же серии (или того же автора) из библиотеки */
+static void same_series(const char *path, char *out, size_t n)
+{
+	size_t o = 0;
+	out[0] = 0;
+	char author[300], title[300], series[300], num[32];
+	if (!cache_title(path, author, sizeof author, title, sizeof title, series, sizeof series, num, sizeof num))
+		return;
+	FILE *f = fopen(CACHE_PATH, "r");
+	if (!f)
+		return;
+	struct {
+		int num;
+		char t[200];
+	} *list = malloc(40 * sizeof *list);
+	int k = 0;
+	char line[2048];
+	while (list && k < 40 && fgets(line, sizeof line, f)) {
+		line[strcspn(line, "\n")] = 0;
+		char *fld[5] = {line};
+		for (int i = 1; i < 5 && fld[i - 1]; i++) {
+			char *t = strchr(fld[i - 1], '\t');
+			if (t)
+				*t = 0;
+			fld[i] = t ? t + 1 : NULL;
+		}
+		if (!fld[4] || !strcmp(fld[0], path) || !fld[2][0])
+			continue;
+		int same = series[0] ? !strcmp(fld[3], series) : author[0] && !strcmp(fld[1], author);
+		if (!same)
+			continue;
+		/* одна книга бывает в кэше дважды (fb2 и fb2.zip) — по названию не повторяем */
+		int dup = 0;
+		for (int i = 0; i < k && !dup; i++)
+			dup = !strcmp(list[i].t, fld[2]);
+		if (dup)
+			continue;
+		list[k].num = atoi(fld[4]);
+		copy(list[k].t, sizeof list[k].t, fld[2]);
+		k++;
+	}
+	fclose(f);
+	if (!list)
+		return;
+	for (int i = 1; i < k; i++)
+		for (int j = i; j > 0 && list[j - 1].num > list[j].num; j--) {
+			typeof(*list) t = list[j];
+			list[j] = list[j - 1];
+			list[j - 1] = t;
+		}
+	if (k) {
+		if (series[0])
+			o += snprintf(out + o, n - o, "Ещё в серии «%s»%s%s:\n", series, num[0] ? ", эта — № " : "", num);
+		else
+			o += snprintf(out + o, n - o, "Ещё у автора в библиотеке:\n");
+		for (int i = 0; i < k && o + 8 < n; i++) {
+			if (series[0] && list[i].num)
+				o += snprintf(out + o, n - o, "%d. %s\n", list[i].num, list[i].t);
+			else
+				o += snprintf(out + o, n - o, "• %s\n", list[i].t);
+		}
+	}
+	free(list);
+}
+
+/* объём книги: слова и знаки текста (без разметки и картинок); считаем раз на книгу */
+static void book_volume(const char *path, long *words, long *chars)
+{
+	static char done[512];
+	static long w, c;
+	if (strcmp(done, path)) {
+		w = c = 0;
+		FILE *f = fopen(path, "rb");
+		char *x = NULL;
+		size_t len = 0;
+		if (f) {
+			unsigned char magic[4] = {0};
+			if (fread(magic, 1, 4, f) == 4 && !memcmp(magic, "PK\3\4", 4))
+				x = zip_read(f, NULL, ".fb2", 48u << 20, &len);
+			else {
+				fseek(f, 0, SEEK_END);
+				long sz = ftell(f);
+				if (sz > 0 && sz < (48l << 20) && (x = malloc(sz + 1))) {
+					fseek(f, 0, SEEK_SET);
+					len = fread(x, 1, sz, f);
+					x[len] = 0;
+				}
+			}
+			fclose(f);
+		}
+		if (x) {
+			char head[200];
+			copy(head, sizeof head, x);
+			int utf8 = !strstr(head, "encoding=") || strcasestr(head, "utf-8");
+			char *p = strstr(x, "</description>");
+			p = p ? p : x;
+			int tag = 0, word = 0;
+			for (; *p; p++) {
+				unsigned char ch = *p;
+				if (ch == '<') {
+					if (!strncmp(p, "<binary", 7))
+						break; /* картинки в конце файла */
+					tag = 1;
+					word = 0;
+					continue;
+				}
+				if (tag) {
+					tag = ch != '>';
+					continue;
+				}
+				if (utf8 && (ch & 0xc0) == 0x80)
+					continue;
+				if (ch <= ' ') {
+					word = 0;
+					continue;
+				}
+				c++;
+				if (!word) {
+					word = 1;
+					w++;
+				}
+			}
+			free(x);
+			c += w; /* пробел между словами */
+		}
+		copy(done, sizeof done, path);
+	}
+	*words = w;
+	*chars = c;
+}
+
+static void fmt_count(char *out, size_t n, long v)
+{
+	if (v >= 1000000)
+		snprintf(out, n, "%.1f млн", v / 1e6);
+	else if (v >= 1000)
+		snprintf(out, n, "%ld тыс.", (v + 500) / 1000);
+	else
+		snprintf(out, n, "%ld", v);
+}
+
+/* вкладка «Всего»: месяц, год, всё время и время по книгам */
+static void total_text(struct sagg *g, char *out, size_t n, char *list, size_t ln)
+{
+	size_t o = 0, lo = 0;
+	out[0] = list[0] = 0;
+	int ty, tm, td;
+	day_civil(g->today, &ty, &tm, &td);
+	long mon0 = g->today - td + 1, year0;
+	char yb[12];
+	snprintf(yb, sizeof yb, "%d-01-01", ty);
+	year0 = day_num(yb);
+	int bm = 0, by = 0;
+	for (int i = 0; i < g->nbooks; i++) {
+		bm += g->books[i].in_mon;
+		by += g->books[i].in_year;
+	}
+	char t[48], d1[16];
+	struct ssum2 m = sum_days(g->all, g->nall, mon0, g->today);
+	struct ssum2 y = sum_days(g->all, g->nall, year0, g->today);
+	struct ssum2 a = sum_days(g->all, g->nall, 0, LONG_MAX);
+	if (!a.days) {
+		snprintf(out, n, "Статистика копится, пока читаешь.\n");
+		return;
+	}
+	fmt_secs(t, sizeof t, m.secs);
+	o += snprintf(out + o, n - o, "%s %d: %s · %d стр. · дней %d · книг %d\n", mon_nom[tm - 1], ty, t, m.pages, m.days, bm);
+	fmt_secs(t, sizeof t, y.secs);
+	o += snprintf(out + o, n - o, "%d год: %s · %d стр. · дней %d · книг %d\n", ty, t, y.pages, y.days, by);
+	fmt_secs(t, sizeof t, a.secs);
+	int fy, fm, fd;
+	day_civil(a.first, &fy, &fm, &fd);
+	snprintf(d1, sizeof d1, "%02d.%02d.%d", fd, fm, fy);
+	o += snprintf(out + o, n - o, "Всё время: %s · %d стр. · с %s\n", t, a.pages, d1);
+	/* по книгам: дольше читал — выше */
+	int idx[AGG_BOOKS];
+	for (int i = 0; i < g->nbooks; i++)
+		idx[i] = i;
+	for (int i = 1; i < g->nbooks; i++)
+		for (int j = i; j > 0 && g->books[idx[j - 1]].secs < g->books[idx[j]].secs; j--) {
+			int x = idx[j];
+			idx[j] = idx[j - 1];
+			idx[j - 1] = x;
+		}
+	for (int i = 0; i < g->nbooks && lo + 16 < ln; i++) {
+		struct sbook *b = &g->books[idx[i]];
+		char author[300], title[300];
+		if (!cache_title(b->path, author, sizeof author, title, sizeof title, NULL, 0, NULL, 0)) {
+			const char *fn = strrchr(b->path, '/');
+			copy(title, sizeof title, fn ? fn + 1 : b->path);
+			author[0] = 0;
+		}
+		fmt_secs(t, sizeof t, b->secs);
+		lo += snprintf(list + lo, ln - lo, "%s · %s%s%s\n", t, author, author[0] ? " — " : "", title);
+	}
+}
+
+/* жанры fb2 по-русски (самые частые; незнакомые остаются как есть) */
+static const char *const genre_ru[][2] = {
+	{"prose_contemporary", "современная проза"}, {"prose_classic", "классическая проза"},
+	{"prose_rus_classic", "русская классика"}, {"prose_su_classics", "советская классика"},
+	{"prose_history", "историческая проза"}, {"prose_military", "военная проза"},
+	{"prose_counter", "контркультура"}, {"prose", "проза"}, {"short_story", "рассказ"},
+	{"sf", "фантастика"}, {"sf_action", "боевая фантастика"}, {"sf_epic", "эпическая фантастика"},
+	{"sf_heroic", "героическая фантастика"}, {"sf_space", "космическая фантастика"},
+	{"sf_social", "социальная фантастика"}, {"sf_history", "альтернативная история"},
+	{"sf_cyberpunk", "киберпанк"}, {"sf_humor", "юмористическая фантастика"},
+	{"sf_detective", "фантастический детектив"}, {"sf_horror", "ужасы"},
+	{"sf_postapocalyptic", "постапокалипсис"}, {"sf_fantasy", "фэнтези"}, {"fantasy", "фэнтези"},
+	{"detective", "детектив"}, {"det_classic", "классический детектив"}, {"det_police", "полицейский детектив"},
+	{"det_irony", "иронический детектив"}, {"det_history", "исторический детектив"},
+	{"det_espionage", "шпионский детектив"}, {"det_crime", "криминальный детектив"},
+	{"det_political", "политический детектив"}, {"thriller", "триллер"},
+	{"love", "любовный роман"}, {"love_contemporary", "современный любовный роман"},
+	{"love_history", "исторический любовный роман"}, {"adventure", "приключения"},
+	{"adv_history", "исторические приключения"}, {"adv_maritime", "морские приключения"},
+	{"adv_western", "вестерн"}, {"children", "детская литература"}, {"child_tale", "сказка"},
+	{"poetry", "поэзия"}, {"dramaturgy", "драматургия"}, {"antique", "старинная литература"},
+	{"humor", "юмор"}, {"humor_prose", "юмористическая проза"}, {"nonfiction", "нон-фикшн"},
+	{"nonf_biography", "биография"}, {"nonf_publicism", "публицистика"},
+	{"sci_history", "история"}, {"sci_philosophy", "философия"}, {"sci_psychology", "психология"},
+	{"sci_popular", "научно-популярное"}, {"religion", "религия"}, {"reference", "справочник"},
+	{"home", "дом и семья"}, {"comp_programming", "программирование"},
+};
+
+static void ru_genres(char *v, size_t n)
+{
+	char src[1024], *out = v;
+	copy(src, sizeof src, v);
+	size_t o = 0;
+	out[0] = 0;
+	for (char *p = src; *p;) {
+		char *e = strchr(p, ',');
+		if (e)
+			*e = 0;
+		while (*p == ' ')
+			p++;
+		const char *r = p;
+		for (unsigned i = 0; i < sizeof genre_ru / sizeof genre_ru[0]; i++)
+			if (!strcmp(p, genre_ru[i][0]))
+				r = genre_ru[i][1];
+		if (*r && !strstr(out, r))
+			o += snprintf(out + o, n - o, "%s%s", o ? ", " : "", r);
+		if (!e)
+			break;
+		p = e + 1;
+	}
+}
+
+static const char *ru_lang(const char *l)
+{
+	static const char *const m[][2] = {{"ru", "русский"}, {"en", "английский"}, {"uk", "украинский"},
+		{"be", "белорусский"}, {"de", "немецкий"}, {"fr", "французский"}, {"es", "испанский"},
+		{"it", "итальянский"}, {"pl", "польский"}, {"cs", "чешский"}, {"ja", "японский"},
+		{"zh", "китайский"}, {"sv", "шведский"}, {"pt", "португальский"}, {"la", "латынь"}};
+	for (unsigned i = 0; i < sizeof m / sizeof m[0]; i++)
+		if (!strcasecmp(l, m[i][0]))
+			return m[i][1];
+	return l;
+}
+
+/* описание из fb2; *head_end — где кончается «шапка» (до аннотации) */
+static char *book_info(const char *path, size_t *head_end)
+{
+	size_t n = 32 * 1024, o = 0;
+	char *out = malloc(n);
+	if (!out)
+		return NULL;
+	out[0] = 0;
+	*head_end = 0;
+	FILE *f = fopen(path, "rb");
+	char *xml = NULL;
+	size_t len = 0;
+	long fsize = 0;
+	if (f) {
+		unsigned char magic[4] = {0};
+		fread(magic, 1, 4, f);
+		fseek(f, 0, SEEK_END);
+		fsize = ftell(f);
+		if (!memcmp(magic, "PK\3\4", 4))
+			xml = zip_read(f, NULL, ".fb2", 256 * 1024, &len);
+		else if ((xml = malloc(256 * 1024 + 1))) {
+			fseek(f, 0, SEEK_SET);
+			len = fread(xml, 1, 256 * 1024, f);
+			xml[len] = 0;
+		}
+		fclose(f);
+	}
+	char *v = malloc(16 * 1024);
+	if (xml && v) {
+		xml = to_utf8(xml, len);
+		char *de = strstr(xml, "</description>");
+		if (de)
+			*de = 0;
+		char *ti = strstr(xml, "<title-info"), *pi = strstr(xml, "<publish-info"), *di = strstr(xml, "<document-info");
+		char *src = strstr(xml, "<src-title-info");
+		/* части описания отдельными строками, чтобы поиск тега не убегал в соседнюю */
+		char *tie = ti ? strstr(ti, "</title-info>") : NULL;
+		char *pie = pi ? strstr(pi, "</publish-info>") : NULL;
+		char *die = di ? strstr(di, "</document-info>") : NULL;
+		char *sre = src ? strstr(src, "</src-title-info>") : NULL;
+		if (tie) *tie = 0;
+		if (pie) *pie = 0;
+		if (die) *die = 0;
+		if (sre) *sre = 0;
+		if (ti) {
+			xml_text(ti, "book-title", v, 16384, NULL);
+			info_add(out, n, &o, "", v);
+			xml_all(ti, "author", 1, v, 16384);
+			info_add(out, n, &o, "Автор", v);
+			const char *sq = strstr(ti, "<sequence");
+			if (sq) {
+				char name[300] = "", num[32] = "", t[400];
+				xml_attr(sq, "name", name, sizeof name);
+				xml_attr(sq, "number", num, sizeof num);
+				snprintf(t, sizeof t, "%s%s%s", name, num[0] ? ", № " : "", num);
+				info_add(out, n, &o, "Серия", name[0] ? t : NULL);
+			}
+			xml_all(ti, "genre", 0, v, 16384);
+			ru_genres(v, 16384);
+			info_add(out, n, &o, "Жанр", v);
+			xml_text(ti, "date", v, 16384, NULL);
+			info_add(out, n, &o, "Год", v);
+			char lang[32] = "", slang[32] = "", t[80];
+			xml_text(ti, "lang", lang, sizeof lang, NULL);
+			xml_text(ti, "src-lang", slang, sizeof slang, NULL);
+			snprintf(t, sizeof t, "%s%s%s%s", ru_lang(lang), slang[0] && strcmp(slang, lang) ? " (оригинал: " : "",
+				slang[0] && strcmp(slang, lang) ? ru_lang(slang) : "", slang[0] && strcmp(slang, lang) ? ")" : "");
+			info_add(out, n, &o, "Язык", lang[0] ? t : NULL);
+			xml_all(ti, "translator", 1, v, 16384);
+			info_add(out, n, &o, "Перевод", v);
+			xml_text(ti, "keywords", v, 16384, NULL);
+			info_add(out, n, &o, "Ключевые слова", v);
+		}
+		if (src) {
+			xml_text(src, "book-title", v, 16384, NULL);
+			info_add(out, n, &o, "Название оригинала", v);
+		}
+		if (pi) {
+			char pub[300] = "", city[100] = "", year[32] = "", isbn[64] = "", bn[300] = "", t[900];
+			xml_text(pi, "book-name", bn, sizeof bn, NULL);
+			xml_text(pi, "publisher", pub, sizeof pub, NULL);
+			xml_text(pi, "city", city, sizeof city, NULL);
+			xml_text(pi, "year", year, sizeof year, NULL);
+			xml_text(pi, "isbn", isbn, sizeof isbn, NULL);
+			snprintf(t, sizeof t, "%s%s%s%s%s", pub, pub[0] && city[0] ? ", " : "", city, (pub[0] || city[0]) && year[0] ? ", " : "", year);
+			info_add(out, n, &o, "Издание", t);
+			info_add(out, n, &o, "ISBN", isbn);
+			if (bn[0] && ti) {
+				char title[300] = "";
+				xml_text(ti, "book-title", title, sizeof title, NULL);
+				if (strcmp(bn, title))
+					info_add(out, n, &o, "Название издания", bn);
+			}
+		}
+		*head_end = o;
+		if (ti) {
+			xml_para(ti, "annotation", v, 16384);
+			if (v[0]) {
+				info_add(out, n, &o, "", "");
+				o += snprintf(out + o, n - o, "\nАннотация\n%s\n", v);
+			}
+		}
+		if (di) {
+			char who[300] = "", prog[200] = "", date[64] = "", ver[32] = "", t[800];
+			xml_all(di, "author", 1, who, sizeof who);
+			xml_text(di, "program-used", prog, sizeof prog, NULL);
+			xml_text(di, "date", date, sizeof date, NULL);
+			xml_text(di, "version", ver, sizeof ver, NULL);
+			snprintf(t, sizeof t, "%s%s%s%s%s%s%s", who, who[0] && date[0] ? ", " : "", date,
+				ver[0] ? ", версия " : "", ver, prog[0] ? ", " : "", prog);
+			if (t[0])
+				o += snprintf(out + o, n - o, "\nФайл подготовил: %s\n", t);
+		}
+		free(xml);
+	} else
+		free(xml);
+	const char *fn = strrchr(path, '/');
+	o += snprintf(out + o, n - o, "\nФайл: %s, %.1f МБ\n", fn ? fn + 1 : path, fsize / 1048576.0);
+	free(v);
+	return out;
+}
+
+/* окно «О книге»: вкладки сверху, листание и «Закрыть» снизу, содержимое — столбиком (flex) */
+#define LV_SIZE_CONTENT 0x3fffffff
+#define LV_FLEX_ROW 0
+#define LV_FLEX_COLUMN 1
+#define LV_TEXT_CENTER 2
+#define INFO_TABS 4
+
+static const char *const info_tab_names[INFO_TABS] = {"Чтение", "Книга", "Главы", "Всего"};
+
+static struct {
+	void *root, *body;
+	void *tab_btn[INFO_TABS], *tab_lbl[INFO_TABS];
+	int W, H, tab;
+	const void *font_s;
+} info;
+
+static struct {
+	void (*set_width)(void *, int32_t), (*set_height)(void *, int32_t);
+	void (*flex_flow)(void *, int);
+	void (*pad_row)(void *, int32_t, uint32_t), (*pad_col)(void *, int32_t, uint32_t);
+	void (*pad_left)(void *, int32_t, uint32_t), (*pad_right)(void *, int32_t, uint32_t);
+	void (*pad_top)(void *, int32_t, uint32_t), (*pad_bottom)(void *, int32_t, uint32_t);
+	void (*line_space)(void *, int32_t, uint32_t);
+	void (*update_layout)(const void *);
+	void (*scroll_to_view)(void *, int);
+	void (*scroll_by)(void *, int32_t, int32_t, int);
+	void *(*image_create)(void *);
+	void (*image_src)(void *, const void *);
+	int ok;
+} lx;
+
+static int lx_init(void)
+{
+	static int done;
+	if (done)
+		return lx.ok;
+	done = 1;
+#define S(f, n) if (!(*(void **)&lx.f = dlsym(RTLD_DEFAULT, n))) { logf_("о книге: нет %s", n); return 0; }
+	S(set_width, "lv_obj_set_width") S(set_height, "lv_obj_set_height") S(flex_flow, "lv_obj_set_flex_flow")
+	S(pad_row, "lv_obj_set_style_pad_row") S(pad_col, "lv_obj_set_style_pad_column")
+	S(pad_left, "lv_obj_set_style_pad_left") S(pad_right, "lv_obj_set_style_pad_right")
+	S(pad_top, "lv_obj_set_style_pad_top") S(pad_bottom, "lv_obj_set_style_pad_bottom")
+	S(line_space, "lv_obj_set_style_text_line_space") S(update_layout, "lv_obj_update_layout")
+	S(scroll_to_view, "lv_obj_scroll_to_view") S(scroll_by, "lv_obj_scroll_by_bounded")
+	S(image_create, "lv_image_create") S(image_src, "lv_image_set_src")
+#undef S
+	lx.ok = 1;
+	return 1;
+}
+
+static void info_close(void)
+{
+	if (info.root && lv.is_valid(info.root))
+		ui.obj_delete(info.root);
+	info.root = info.body = NULL;
+	if (info_menu && lv.is_valid(info_menu))
+		ui.remove_flag(info_menu, LV_FLAG_HIDDEN);
+	info_menu = NULL;
+}
+
+static int info_is_open(void)
+{
+	return info.root != NULL;
+}
+
+/* прозрачный блок без стилей */
+static void *ix_box(void *parent, int w, int h)
+{
+	void *b = ui.obj_create(parent);
+	ui.remove_style_all(b);
+	ui.set_size(b, w, h);
+	ui.remove_flag(b, LV_FLAG_SCROLLABLE);
+	return b;
+}
+
+static void *ix_text(void *parent, const char *text, const void *font, int w)
+{
+	/* хвостовые переводы строк дают пустоту под блоком — отступы и так есть */
+	size_t n = strlen(text);
+	char *t = NULL;
+	if (n && text[n - 1] == '\n' && (t = strdup(text))) {
+		while (n && t[n - 1] == '\n')
+			t[--n] = 0;
+		text = t;
+	}
+	void *l = ui_label(parent, text, font);
+	free(t);
+	lx.set_width(l, w);
+	lx.line_space(l, 4, 0);
+	return l;
+}
+
+/* недельный столбик: минуты над столбиком, день под ним */
+static void week_chart(void *parent, struct sagg *g, int w)
+{
+	ix_text(parent, "Неделя, минут в день по всем книгам", info.font_s, w);
+	/* подписи-минуты над столбиками, под ними день недели и дата в две строки */
+	int top = 34, bar_max = 130, col = w / 7, h = top + bar_max + 6 + 72;
+	void *box = ix_box(parent, w, h);
+	double v[7], mx = 1800; /* шкала не меньше получаса: минута — не во всю высоту */
+	for (int i = 0; i < 7; i++) {
+		v[i] = day_secs(g->all, g->nall, g->today - 6 + i);
+		if (v[i] > mx)
+			mx = v[i];
+	}
+	for (int i = 0; i < 7; i++) {
+		long dn = g->today - 6 + i;
+		int bh = mx > 0 ? (int)(v[i] / mx * bar_max + 0.5) : 0;
+		if (v[i] > 0 && bh < 4)
+			bh = 4;
+		char t[32];
+		if (v[i] >= 3600)
+			snprintf(t, sizeof t, "%.1f ч", v[i] / 3600);
+		else
+			snprintf(t, sizeof t, "%d", (int)(v[i] / 60 + 0.5));
+		void *lt = ui_label(box, v[i] > 0 ? t : "", info.font_s);
+		lx.set_width(lt, col);
+		ui.text_align(lt, LV_TEXT_CENTER, 0);
+		ui.set_pos(lt, i * col, top + bar_max - bh - 34);
+		/* столбик; пустой день — тонкая черта */
+		void *bar = ix_box(box, col - 24, bh ? bh : 2);
+		ui.bg_color(bar, BLACK, 0);
+		ui.bg_opa(bar, bh ? 255 : 120, 0);
+		ui.set_pos(bar, i * col + 12, top + bar_max - (bh ? bh : 2));
+		char d[16], sd[8];
+		snprintf(d, sizeof d, "%s\n%s", wday_ru[(dn % 7 + 10) % 7], short_date(dn, sd, sizeof sd));
+		void *ld = ui_label(box, d, info.font_s);
+		lx.set_width(ld, col);
+		ui.text_align(ld, LV_TEXT_CENTER, 0);
+		ui.set_pos(ld, i * col, top + bar_max + 6);
+	}
+}
+
+static void tab_reading(void *body, int w)
+{
+	struct sagg *g = stats_agg(cur_book);
+	char *a = malloc(4096), *b = malloc(2048);
+	if (g && a && b) {
+		reading_text(cur_book, g, a, 4096, b, 2048);
+		ix_text(body, a + strspn(a, "\n"), panel.font, w);
+		if (g->nall) {
+			week_chart(body, g, w);
+			ix_text(body, b, panel.font, w);
+		}
+	}
+	free(a);
+	free(b);
+}
+
+static void tab_book(void *body, int w)
+{
+	size_t head_end = 0;
+	char *text = book_info(cur_book, &head_end);
+	if (!text)
+		return;
+	char thumb[700];
+	const char *rel = !strncmp(cur_book, "/userdata/", 10) ? cur_book + 10 : NULL;
+	snprintf(thumb, sizeof thumb, "/userdata/.system/thumbnails/%s.png", rel ? rel : "");
+	int cover = rel && file_exists(thumb);
+	char saved = text[head_end];
+	text[head_end] = 0;
+	/* обложка слева, описание справа */
+	void *row = ix_box(body, w, LV_SIZE_CONTENT);
+	lx.flex_flow(row, LV_FLEX_ROW);
+	lx.pad_col(row, 20, 0);
+	if (cover) {
+		char src[720];
+		snprintf(src, sizeof src, "A:%s", thumb);
+		void *img = lx.image_create(row);
+		lx.image_src(img, src);
+		ui.set_size(img, 180, 240);
+	}
+	ix_text(row, text, panel.font, cover ? w - 200 : w);
+	text[head_end] = saved;
+	long words, chars;
+	book_volume(cur_book, &words, &chars);
+	if (words > 0) {
+		char vw[32], vc[32], t[160], tm[32];
+		fmt_count(vw, sizeof vw, words);
+		fmt_count(vc, sizeof vc, chars);
+		int o = snprintf(t, sizeof t, "Объём: %s слов · %s знаков", vw, vc);
+		if (st.has && !strcmp(st.book, cur_book) && st.total > 0 && (st.book_pages + st.all_pages) > 0) {
+			fmt_secs(tm, sizeof tm, st.total * stats_spp());
+			snprintf(t + o, sizeof t - o, " · целиком ~%s", tm);
+		}
+		ix_text(body, t, panel.font, w);
+	}
+	char *more = malloc(8192);
+	if (more) {
+		same_series(cur_book, more, 8192);
+		if (more[0])
+			ix_text(body, more, info.font_s, w);
+		free(more);
+	}
+	const char *rest = text + head_end;
+	while (*rest == '\n')
+		rest++;
+	if (*rest)
+		ix_text(body, rest, panel.font, w);
+	free(text);
+}
+
+static void tab_toc(void *body, int w)
+{
+	int page = st.has && !strcmp(st.book, cur_book) ? st.page : 0;
+	void *cur = NULL;
+	pthread_mutex_lock(&toc.mu);
+	int n = toc.n, now = -1;
+	for (int i = 0; i < n; i++)
+		if (toc.start[i] <= page)
+			now = i;
+	if (n < 2)
+		ix_text(body, "В книге нет оглавления.", panel.font, w);
+	for (int i = 0; i < n; i++) {
+		char t[160];
+		snprintf(t, sizeof t, "%s  · %d", toc.title[i][0] ? toc.title[i] : "Без названия", toc.start[i]);
+		int ind = (toc.level[i] > 4 ? 4 : toc.level[i]) * 28;
+		void *l = ix_text(body, t, info.font_s, w);
+		lx.pad_left(l, ind + 8, 0);
+		lx.pad_right(l, 8, 0);
+		lx.pad_top(l, 4, 0);
+		lx.pad_bottom(l, 4, 0);
+		if (i == now) {
+			ui.bg_color(l, BLACK, 0);
+			ui.bg_opa(l, 255, 0);
+			ui.text_color(l, WHITE, 0);
+			cur = l;
+		}
+	}
+	pthread_mutex_unlock(&toc.mu);
+	if (cur) {
+		lx.update_layout(body);
+		lx.scroll_to_view(cur, 0);
+		lx.scroll_by(body, 0, info.H / 3, 0); /* текущая глава не у самого края */
+	}
+}
+
+static void tab_total(void *body, int w)
+{
+	struct sagg *g = stats_agg(cur_book);
+	char *a = malloc(2048), *b = malloc(16384);
+	if (g && a && b) {
+		total_text(g, a, 2048, b, 16384);
+		ix_text(body, a, panel.font, w);
+		if (b[0]) {
+			ix_text(body, "По книгам", panel.font, w);
+			ix_text(body, b, info.font_s, w);
+		}
+	}
+	free(a);
+	free(b);
+}
+
+static void info_show(int tab)
+{
+	if (!info.root)
+		return;
+	if (info.body && lv.is_valid(info.body))
+		ui.obj_delete(info.body);
+	info.tab = tab;
+	for (int i = 0; i < INFO_TABS; i++) {
+		ui.bg_color(info.tab_btn[i], i == tab ? BLACK : WHITE, 0);
+		ui.text_color(info.tab_lbl[i], i == tab ? WHITE : BLACK, 0);
+	}
+	int top = 16 + 68 + 12, bottom = 16 + 68 + 12, W = info.W;
+	void *body = ui.obj_create(info.root);
+	ui.remove_style_all(body);
+	ui.set_pos(body, 0, top);
+	ui.set_size(body, W, info.H - top - bottom);
+	lx.flex_flow(body, LV_FLEX_COLUMN);
+	lx.pad_row(body, 18, 0);
+	lx.pad_left(body, 24, 0);
+	lx.pad_right(body, 24, 0);
+	lx.pad_top(body, 4, 0);
+	lx.pad_bottom(body, 24, 0);
+	info.body = body;
+	int w = W - 48;
+	if (tab == 0)
+		tab_reading(body, w);
+	else if (tab == 1)
+		tab_book(body, w);
+	else if (tab == 2)
+		tab_toc(body, w);
+	else
+		tab_total(body, w);
+}
+
+static void info_cb(void *e)
+{
+	intptr_t a = (intptr_t)ui.ev_user(e);
+	if (a == 1) {
+		info_close();
+		return;
+	}
+	if (a >= 10 && a < 10 + INFO_TABS) {
+		if (a - 10 != info.tab)
+			info_show(a - 10);
+		return;
+	}
+	if (info.body)
+		lx.scroll_by(info.body, 0, (a == 2 ? 1 : -1) * (info.H - 260), 0); /* + — содержимое вниз, видно то, что выше */
+}
+
+static void *info_button(void *parent, int x, int y, int w, int h, const char *text, intptr_t act, void **label)
+{
+	void *b = ui.button_create(parent);
+	ui.remove_style_all(b);
+	ui.set_pos(b, x, y);
+	ui.set_size(b, w, h);
+	ui.bg_color(b, WHITE, 0);
+	ui.bg_opa(b, 255, 0);
+	ui.border_color(b, BLACK, 0);
+	ui.border_width(b, 2, 0);
+	ui.radius(b, 10, 0);
+	void *l = ui_label(b, text, panel.font);
+	ui.center(l);
+	if (label)
+		*label = l;
+	ui.add_event_cb(b, info_cb, LV_EVENT_CLICKED, (void *)act);
+	return b;
+}
+
+static int fonts_ready(void)
+{
+	if (panel.font && info.font_s)
+		return 1;
+	static const char *const fonts[] = {"/opt/ylc-ebook/fonts/NotoSans.ttf", "/opt/ylc-ebook/fonts/Arial.ttf"};
+	for (unsigned i = 0; i < 2 && !info.font_s; i++)
+		if (file_exists(fonts[i])) {
+			if (!panel.font) {
+				panel.font = ui.font_create(fonts[i], 0, 30, 0);
+				panel.font_big = ui.font_create(fonts[i], 0, 44, 0);
+			}
+			info.font_s = ui.font_create(fonts[i], 0, 26, 0);
+		}
+	return panel.font && panel.font_big && info.font_s;
+}
+
+static void info_open(void)
+{
+	if (info.root || !ui_init() || !lx_init() || !fonts_ready())
+		return;
+	if (!cur_book[0]) {
+		logf_("о книге: не знаю, какая книга открыта");
+		return;
+	}
+	int W = ui.hor_res(NULL), H = ui.ver_res(NULL);
+	info.W = W;
+	info.H = H;
+	void *root = ui.obj_create(ui.layer_top());
+	ui.remove_style_all(root);
+	ui.set_pos(root, 0, 0);
+	ui.set_size(root, W, H);
+	ui.bg_color(root, WHITE, 0);
+	ui.bg_opa(root, 255, 0);
+	ui.add_flag(root, LV_FLAG_CLICKABLE);
+	ui.remove_flag(root, LV_FLAG_SCROLLABLE);
+	info.root = root;
+	info.body = NULL;
+	int bh = 68, gap = 12;
+	int tw = (W - 24 * 2 - gap * (INFO_TABS - 1)) / INFO_TABS;
+	for (int i = 0; i < INFO_TABS; i++)
+		info.tab_btn[i] = info_button(root, 24 + i * (tw + gap), 16, tw, bh, info_tab_names[i], 10 + i, &info.tab_lbl[i]);
+	int bw = (W - 24 * 2 - gap * 2) / 3, by = H - 16 - bh;
+	info_button(root, 24, by, bw, bh, "Выше", 2, NULL);
+	info_button(root, 24 + bw + gap, by, bw, bh, "Закрыть", 1, NULL);
+	info_button(root, 24 + (bw + gap) * 2, by, bw, bh, "Ниже", 3, NULL);
+	info_show(0);
+	logf_("о книге: %s", cur_book);
+}
+
+/* ---------- простой: главный цикл спит дольше, касание и кнопки будят сразу ---------- */
+
+static int idle_now(void)
+{
+	return active && cfg.idle_ms > 0 && since_ms(&last_input) > 3000 && since_ms(&last_flush) > 1500 &&
+	       !panel.backdrop && !info.root;
+}
+
+/* программа: t = lv_timer_handler(); если t > 10 — usleep(min(t, 250) мс). Таймеры LVGL
+   (опрос сенсора 30 мс, перерисовка 33 мс) будят её ~65 раз в секунду, даже когда ничего не происходит */
+static __thread int loop_sleep;
+static unsigned idle_naps, loop_pauses;
+
+int usleep(useconds_t us)
+{
+	static int (*real)(useconds_t);
+	if (!real)
+		real = dlsym(RTLD_NEXT, "usleep");
+	int mine = loop_sleep;
+	loop_sleep = 0;
+	if (mine)
+		loop_pauses++;
+	if (mine && us >= 10000 && idle_now()) {
+		struct pollfd p[9];
+		int n = 0;
+		if (wake_fd >= 0)
+			p[n++] = (struct pollfd){wake_fd, POLLIN, 0};
+		for (int fd = 0; fd < 256 && n < 9; fd++)
+			if (key_fd[fd] == 1 || key_fd[fd] == 3)
+				p[n++] = (struct pollfd){fd, POLLIN, 0};
+		if (n > 1) {
+			if (poll(p, n, cfg.idle_ms) > 0 && wake_fd >= 0 && (p[0].revents & POLLIN)) {
+				uint64_t v;
+				ssize_t r = read(wake_fd, &v, sizeof v);
+				(void)r;
+			}
+			idle_naps++;
+			return 0;
+		}
+	}
+	return real(us);
+}
+
+/* кадр ушёл на экран — что-то меняется (анимация, загрузка): не засыпаем */
+int rkebc_client_enqueue_buf(void *client, void *buf)
+{
+	static int (*real)(void *, void *);
+	if (!real)
+		real = dlsym(RTLD_NEXT, "rkebc_client_enqueue_buf");
+	clock_gettime(CLOCK_MONOTONIC, &last_flush);
+	return real(client, buf);
+}
+
+int rkebc_client_transmit_buf(void *client, void *buf)
+{
+	static int (*real)(void *, void *);
+	if (!real)
+		real = dlsym(RTLD_NEXT, "rkebc_client_transmit_buf");
+	clock_gettime(CLOCK_MONOTONIC, &last_flush);
+	return real(client, buf);
+}
+
+/* другие потоки отдают работу интерфейсу — разбудить */
+int lv_async_call(void (*cb)(void *), void *user)
+{
+	static int (*real)(void (*)(void *), void *);
+	if (!real)
+		real = dlsym(RTLD_NEXT, "lv_async_call");
+	int r = real ? real(cb, user) : -1;
+	if (!main_known || !pthread_equal(pthread_self(), main_thread))
+		wake_main();
+	return r;
+}
+
+void lv_unlock(void)
+{
+	static void (*real)(void);
+	if (!real)
+		real = dlsym(RTLD_NEXT, "lv_unlock");
+	if (real)
+		real();
+	if (main_known && !pthread_equal(pthread_self(), main_thread))
+		wake_main();
+}
+
+static int input_kind(int fd);
+static void gesture_run(void);
+
+/* устройства ввода узнаём заранее: сенсор читается без ожидания и до первого касания
+   read() ничего не возвращает, а спать надо уже до него */
+static void find_inputs(void)
+{
+	DIR *d = opendir("/proc/self/fd");
+	if (!d)
+		return;
+	struct dirent *e;
+	while ((e = readdir(d))) {
+		int fd = atoi(e->d_name);
+		if (fd <= 2 || fd >= 256 || key_fd[fd])
+			continue;
+		char path[64], to[64];
+		snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+		ssize_t k = readlink(path, to, sizeof to - 1);
+		if (k <= 0)
+			continue;
+		to[k] = 0;
+		if (!strncmp(to, "/dev/input/event", 16))
+			key_fd[fd] = input_kind(fd);
+	}
+	closedir(d);
+}
+
+static void reading_tick(void)
+{
+	if (!main_known) {
+		main_thread = pthread_self();
+		main_known = 1;
+		wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	}
+	gesture_run();
+	int k = win_key;
+	if (k) {
+		win_key = 0;
+		if (k == 1) {
+			info_close();
+			panel_close();
+		} else if (info.body)
+			lx.scroll_by(info.body, 0, (k == 2 ? 1 : -1) * (info.H - 260), 0);
+	}
+	/* читалку закрыли (кнопкой программы и т. п.) — окна мода не оставляем висеть */
+	if ((info_is_open() || panel.backdrop) && reader_scr) {
+		void *(*scr_act)(void) = dlsym(RTLD_DEFAULT, "lv_screen_active");
+		if (scr_act && scr_act() != reader_scr) {
+			info_close();
+			panel_close();
+		}
+	}
+	if (info_item) {
+		info_label = info_item;
+		info_item = NULL;
+		item_hook(info_label);
+	}
+	static time_t scanned;
+	if (time(NULL) - scanned >= 10) {
+		scanned = time(NULL);
+		find_inputs();
+	}
+	/* давно не листали — записать накопленное */
+	if ((st.pages || st.secs >= 1) && since_ms(&st.turn) > 600000)
+		stats_flush();
+	static time_t minute;
+	time_t now = time(NULL);
+	if (cfg.debug > 1 && now / 60 != minute) {
+		if (minute) {
+			int nin = 0;
+			for (int fd = 0; fd < 256; fd++)
+				nin += key_fd[fd] == 1 || key_fd[fd] == 3;
+			logf_("простой: за минуту пауз цикла %u, из них долгих %u (до %d мс), устройств ввода %d, %.0f с без касаний",
+				loop_pauses, idle_naps, cfg.idle_ms, nin, since_ms(&last_input) / 1000);
+		}
+		idle_naps = loop_pauses = 0;
+		minute = now / 60;
+	}
+}
+
 uint32_t lv_timer_handler(void)
 {
 	static uint32_t (*real)(void);
@@ -2979,6 +4730,7 @@ uint32_t lv_timer_handler(void)
 	if (!real)
 		real = dlsym(RTLD_NEXT, "lv_timer_handler");
 	uint32_t r = real();
+	reading_tick();
 	tiles_poll();
 	static unsigned watch;
 	if (!(++watch & 7))
@@ -2997,6 +4749,30 @@ uint32_t lv_timer_handler(void)
 			unlink(SHOT_FLAG);
 			shot();
 		}
+		/* отладка окна «О книге» без касаний: echo 2 > /dev/shm/luma-test/info (вкладка 0..3, «x» — закрыть) */
+		FILE *fi = cfg.debug > 1 ? fopen("/dev/shm/luma-test/info", "r") : NULL;
+		if (fi) {
+			char c = 0, line[512] = "";
+			if (fgets(line, sizeof line, fi))
+				c = line[0];
+			fclose(fi);
+			if (c == '/') { /* путь книги — если сейчас ни одна не открыта */
+				line[strcspn(line, "\n")] = 0;
+				copy(cur_book, sizeof cur_book, line);
+				c = '0';
+			}
+			unlink("/dev/shm/luma-test/info");
+			if (c == 'x') {
+				info_close();
+				panel_close();
+			} else if (c == 'p')
+				panel_open();
+			else {
+				info_open();
+				if (info.root && c >= '0' && c <= '3')
+					info_show(c - '0');
+			}
+		}
 		if (cfg.thumbs && thumbs_dirty)
 			thumbs_start();
 		/* отладка экрана сна: путь книги в /dev/shm/luma-test/sleep */
@@ -3012,6 +4788,7 @@ uint32_t lv_timer_handler(void)
 				sleep_cover_for(p);
 		}
 	}
+	loop_sleep = 1; /* следующий usleep этого потока — пауза главного цикла */
 	return r;
 }
 
@@ -3133,8 +4910,6 @@ void lv_label_set_text_fmt(void *obj, const char *fmt, ...)
    мод меняет верх и низ местами. Две кнопки разом держать 3 с — переключить раскладку (запоминается) */
 #define BTN_STATE LUMA_DIR "/buttons.state"
 static const uint16_t btn_code[4] = {616, 617, 614, 615};
-static int active;           /* мод работает только в ylc-ebook */
-static unsigned char key_fd[256]; /* 0 — не смотрели, 1 — кнопки, 2 — другое */
 static int btn_on = -1;      /* текущая раскладка: 1 = верх и низ поменяны */
 
 struct kev {
@@ -3156,17 +4931,49 @@ static int btn_map(int idx, int on)
 	return on ? btn_code[idx ^ 1] : btn_code[idx];
 }
 
-static int is_keys(int fd)
+/* 1 — боковые кнопки, 3 — сенсор, 2 — что-то другое */
+static int input_kind(int fd)
 {
 	char name[64] = "";
 	/* EVIOCGNAME(len) = _IOC(_IOC_READ, 'E', 0x06, len) */
 	if (ioctl(fd, (2u << 30) | (sizeof name << 16) | ('E' << 8) | 0x06, name) < 0)
-		return 0;
-	return !strcmp(name, "gpio-keys");
+		return 2;
+	if (!strcmp(name, "gpio-keys"))
+		return 1;
+	if (!strcmp(name, "goodix-ts")) {
+		if (cfg.touch_log)
+			logf_("касания: сенсор fd %d читает %s поток, %s", fd,
+				main_known && pthread_equal(pthread_self(), main_thread) ? "главный" : "другой",
+				fcntl(fd, F_GETFL) & O_NONBLOCK ? "без ожидания" : "с ожиданием");
+		return 3;
+	}
+	return 2;
 }
+
+/* отладка жестов: кадр касаний одной строкой */
+static void touch_log(struct kev *ev, int count)
+{
+	char line[600];
+	size_t o = 0;
+	for (int i = 0; i < count && o + 24 < sizeof line; i++) {
+		if (ev[i].type == 0 && ev[i].code == 0) {
+			logf_("касания:%s", line);
+			o = 0;
+			line[0] = 0;
+			continue;
+		}
+		o += snprintf(line + o, sizeof line - o, " %d:%x=%d", ev[i].type, ev[i].code, ev[i].value);
+	}
+	if (o)
+		logf_("касания:%s …", line);
+}
+
+/* пока открыто окно мода, кнопки — ему: «назад» и прочие закрывают, листание — прокрутка «О книге».
+   Кнопки читает другой поток, делает главный (win_key) */
 
 static void buttons_filter(struct kev *ev, int count)
 {
+	static unsigned char eat[1024]; /* нажатие досталось окну — отпускание тоже */
 	static int held, combo;
 	static double both_since; /* когда зажали вторую кнопку сочетания */
 	if (btn_on < 0) {
@@ -3175,6 +4982,24 @@ static void buttons_filter(struct kev *ev, int count)
 	}
 	for (int i = 0; i < count; i++) {
 		int idx = ev[i].type == 1 ? btn_index(ev[i].code) : -1;
+		if (ev[i].type == 1 && ev[i].code < 1024 && !combo) {
+			int open = info_is_open() || panel.backdrop;
+			if (ev[i].value == 1 && open) {
+				eat[ev[i].code] = 1;
+				int fwd = idx >= 0 && (btn_map(idx, btn_on) == 617 || btn_map(idx, btn_on) == 615);
+				win_key = idx < 0 ? 1 : !info_is_open() ? 0 : fwd ? 3 : 2;
+				if (cfg.debug > 1)
+					logf_("кнопки: %d — окну мода (%d)", ev[i].code, win_key);
+				wake_main();
+			}
+			if (eat[ev[i].code]) {
+				if (!ev[i].value)
+					eat[ev[i].code] = 0;
+				ev[i].type = ev[i].code = 0;
+				ev[i].value = 0;
+				continue;
+			}
+		}
 		if (idx < 0)
 			continue;
 		int bit = 1 << idx;
@@ -3218,6 +5043,131 @@ static void buttons_filter(struct kev *ev, int count)
 	}
 }
 
+/* ---------- жесты: тап в углу — «О книге» / панель «Текст» ----------
+   goodix шлёт протокол A: на каждый палец TRACKING_ID, X, Y и SYN_MT_REPORT, кадр — SYN_REPORT,
+   отпускание — BTN_TOUCH 0. Координаты панели: X вдоль длинной стороны (сверху вниз в портрете),
+   Y вдоль короткой (справа налево). Штатной программе жест не достаётся: LVGL велим ждать
+   отпускания (lv_indev_wait_release) — тогда отпускание не станет нажатием на страницу */
+#define TOUCH_LONG 1024 /* ось X сенсора */
+#define TOUCH_SHORT 758 /* ось Y сенсора */
+
+static struct {
+	int down, id, contacts, frames, two;
+	int x[2], y[2];          /* текущий кадр, по пальцам */
+	int sx, sy, moved;       /* первый палец: где коснулся и насколько ушёл */
+	struct timespec t0;
+} tg;
+static volatile int gesture_pending; /* 0 — нет, 1..4 — угол */
+
+static int corner_action(const char *a)
+{
+	return !strcmp(a, "panel") ? 1 : !strcmp(a, "info") ? 2 : 0;
+}
+
+/* можно ли перехватывать касания: открыта страница книги, поверх ничего нет, портрет */
+static int gestures_ok(void)
+{
+	if (!active || !ui_init() || panel.backdrop || info_is_open() || !reader_scr)
+		return 0;
+	void *(*scr_act)(void) = dlsym(RTLD_DEFAULT, "lv_screen_active");
+	if (!scr_act || scr_act() != reader_scr || !lv.is_valid(reader_scr))
+		return 0;
+	if (ui.child_count(reader_scr) > reader_kids || ui.child_count(ui.layer_top()))
+		return 0; /* меню программы или окно поверх страницы */
+	return ui.hor_res(NULL) < ui.ver_res(NULL);
+}
+
+static void wait_release(void)
+{
+	static void *(*next)(void *);
+	static int (*type)(void *);
+	static void (*wait)(void *);
+	if (!next) {
+		next = dlsym(RTLD_DEFAULT, "lv_indev_get_next");
+		type = dlsym(RTLD_DEFAULT, "lv_indev_get_type");
+		wait = dlsym(RTLD_DEFAULT, "lv_indev_wait_release");
+	}
+	if (!next || !wait)
+		return;
+	/* lv_indev_get_type в программе нет — ждут все; у кнопок это пройдёт с их отпусканием */
+	for (void *i = next(NULL); i; i = next(i))
+		if (!type || type(i) == 1 /* LV_INDEV_TYPE_POINTER */)
+			wait(i);
+}
+
+static void touch_filter(struct kev *ev, int count)
+{
+	for (int i = 0; i < count; i++) {
+		struct kev *e = &ev[i];
+		if (e->type == 1 && e->code == 0x14a /* BTN_TOUCH */) {
+			if (e->value) {
+				memset(&tg, 0, sizeof tg);
+				tg.down = 1;
+				clock_gettime(CLOCK_MONOTONIC, &tg.t0);
+				continue;
+			}
+			if (!tg.down)
+				continue;
+			tg.down = 0;
+			if (tg.two)
+				continue; /* двумя пальцами — не тап */
+			/* тап в углу: короткий, на месте */
+			int px = TOUCH_SHORT - tg.sy, py = tg.sx, cs = cfg.corner_size;
+			int side = px < cs ? 0 : px > TOUCH_SHORT - cs ? 1 : -1;
+			int end = py < cs ? 0 : py > TOUCH_LONG - cs ? 2 : -1;
+			if (side < 0 || end < 0 || tg.moved > 40 || since_ms(&tg.t0) > 800 || !tg.frames)
+				continue;
+			int c = end + side;
+			if (!corner_action(cfg.corner[c]) || !gestures_ok())
+				continue;
+			wait_release();
+			gesture_pending = 1 + c;
+			continue;
+		}
+		if (!tg.down)
+			continue;
+		if (e->type == 3) {
+			if (e->code == 0x39 /* TRACKING_ID */) {
+				tg.id = e->value > 0 ? 1 : 0;
+				if (e->value > 0)
+					tg.two = 1;
+			} else if (e->code == 0x35)
+				tg.x[tg.id] = e->value;
+			else if (e->code == 0x36)
+				tg.y[tg.id] = e->value;
+		} else if (e->type == 0 && e->code == 2 /* SYN_MT_REPORT */) {
+			tg.contacts++;
+		} else if (e->type == 0 && e->code == 0 /* SYN_REPORT */) {
+			if (tg.contacts >= 1) {
+				if (!tg.frames++) {
+					tg.sx = tg.x[0];
+					tg.sy = tg.y[0];
+				}
+				int m = abs(tg.x[0] - tg.sx) > abs(tg.y[0] - tg.sy) ? abs(tg.x[0] - tg.sx) : abs(tg.y[0] - tg.sy);
+				if (m > tg.moved)
+					tg.moved = m;
+			}
+			tg.contacts = 0;
+		}
+	}
+}
+
+/* из главного цикла: сделать то, что насобирали касания */
+static void gesture_run(void)
+{
+	int g = gesture_pending;
+	if (!g)
+		return;
+	gesture_pending = 0;
+	int a = corner_action(cfg.corner[g - 1]);
+	if (cfg.debug > 1)
+		logf_("жест: угол %d (%s)", g, cfg.corner[g - 1]);
+	if (a == 1)
+		panel_open();
+	else if (a == 2)
+		info_open();
+}
+
 ssize_t read(int fd, void *buf, size_t n)
 {
 	static ssize_t (*real)(int, void *, size_t);
@@ -3227,9 +5177,19 @@ ssize_t read(int fd, void *buf, size_t n)
 	if (!active || r < (ssize_t)sizeof(struct kev) || r % sizeof(struct kev) || fd < 0 || fd >= 256)
 		return r;
 	if (!key_fd[fd])
-		key_fd[fd] = is_keys(fd) ? 1 : 2;
+		key_fd[fd] = input_kind(fd);
+	if (key_fd[fd] == 2)
+		return r;
+	clock_gettime(CLOCK_MONOTONIC, &last_input);
+	if (!main_known || !pthread_equal(pthread_self(), main_thread))
+		wake_main();
 	if (key_fd[fd] == 1)
 		buttons_filter(buf, r / sizeof(struct kev));
+	else {
+		if (cfg.touch_log)
+			touch_log(buf, r / sizeof(struct kev));
+		touch_filter(buf, r / sizeof(struct kev));
+	}
 	return r;
 }
 
@@ -3586,8 +5546,21 @@ char *sqlite3_mprintf(const char *fmt, ...)
 			logf_("текст: общие настройки размер %d, шрифт %d, интервал %d, поля %d", v[0], v[1], v[2], v[3]);
 		}
 	}
-	if (active && fmt && !strcmp(fmt, "UPDATE books SET last_open_time = %lld WHERE id = %d"))
+	if (active && fmt && !strcmp(fmt, "UPDATE books SET last_open_time = %lld WHERE id = %d")) {
 		book_opens++;
+		va_list cp;
+		va_copy(cp, ap);
+		(void)va_arg(cp, long long);
+		int id = va_arg(cp, int);
+		va_end(cp);
+		cur_book[0] = 0;
+		for (int i = 0; i < 64; i++)
+			if (book_ids[i].id == id && book_ids[i].path[0])
+				copy(cur_book, sizeof cur_book, book_ids[i].path);
+		pthread_mutex_lock(&toc.mu);
+		toc.n = 0;
+		pthread_mutex_unlock(&toc.mu);
+	}
 	if (active && cfg.sleep_cover && fmt && !strcmp(fmt, "UPDATE books SET last_open_time = %lld WHERE id = %d")) {
 		va_list cp;
 		va_copy(cp, ap);
