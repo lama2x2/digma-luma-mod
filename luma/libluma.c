@@ -4968,7 +4968,8 @@ static void touch_log(struct kev *ev, int count)
 		logf_("касания:%s …", line);
 }
 
-/* пока открыто окно мода, кнопки — ему: «назад» и прочие закрывают, листание — прокрутка «О книге».
+/* пока открыто окно мода, кнопки — ему: «назад» и прочие закрывают, листание — прокрутка «О книге»,
+   «Домой» закрывает и уходит программе.
    Кнопки читает другой поток, делает главный (win_key) */
 
 static void buttons_filter(struct kev *ev, int count)
@@ -4984,6 +4985,14 @@ static void buttons_filter(struct kev *ev, int count)
 		int idx = ev[i].type == 1 ? btn_index(ev[i].code) : -1;
 		if (ev[i].type == 1 && ev[i].code < 1024 && !combo) {
 			int open = info_is_open() || panel.backdrop;
+			if (ev[i].code == 102 /* KEY_HOME */) {
+				/* «Домой»: окно закрываем, а кнопку отдаём программе — она выходит из книги */
+				if (ev[i].value == 1 && open) {
+					win_key = 1;
+					wake_main();
+				}
+				continue;
+			}
 			if (ev[i].value == 1 && open) {
 				eat[ev[i].code] = 1;
 				int fwd = idx >= 0 && (btn_map(idx, btn_on) == 617 || btn_map(idx, btn_on) == 615);
