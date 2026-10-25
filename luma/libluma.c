@@ -34,6 +34,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <setjmp.h>
+#include <signal.h>
+#include <ucontext.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -129,6 +131,7 @@ static struct {
 	int sort_books;     /* 1 = сортировка библиотеки по настоящим названиям и авторам */
 	int text_anchor;    /* 1 = после смены размера, интервала, полей — страница с тем же текстом */
 	int text_panel;     /* 1 = пункт меню «Размер шрифта» открывает панель «Текст» с − / + */
+	char hide_fonts[512]; /* шрифты, которых нет в меню «Тип шрифта», через запятую */
 } cfg;
 
 static void logf_(const char *fmt, ...)
@@ -194,6 +197,8 @@ static void ini_set(const char *sec, const char *key, char *val)
 	} else if (!strcmp(sec, "text")) {
 		if (!strcmp(key, "global")) {
 			cfg.text_global = atoi(val);
+		} else if (!strcmp(key, "hide_fonts")) {
+			copy(cfg.hide_fonts, sizeof cfg.hide_fonts, val);
 		} else if (!strcmp(key, "panel")) {
 			cfg.text_panel = atoi(val);
 		} else if (!strcmp(key, "keep_place")) {
@@ -319,6 +324,9 @@ static void load_ini(void)
 	cfg.buttons_swap = cfg.buttons_toggle = cfg.text_global = cfg.sleep_cover = cfg.thumbs = cfg.sort_books = 1;
 	cfg.text_anchor = 1;
 	cfg.text_panel = 1;
+	/* без кириллицы и почти одинаковые с оставшимися (Arial ≈ Roboto, Tahoma ≈ Verdana,
+	   Noto Sans и Malgun ≈ Open Sans, Corbel ≈ Calibri) */
+	copy(cfg.hide_fonts, sizeof cfg.hide_fonts, "OpenDyslexicAlta, OpenDyslexicMono, Arial, Tahoma, Noto Sans, Malgun Gothic, Corbel");
 	static const int total[11] = {0, 1, 2, 3, 5, 8, 12, 18, 27, 40, 60};
 	memcpy(cfg.light_total, total, sizeof total);
 
@@ -534,14 +542,15 @@ static void add_faces(struct sbuf *b, const char *prefix, int remapped)
    Хранятся в luma/tune.state и действуют во всех книгах */
 #define TUNE_PATH LUMA_DIR "/tune.state"
 static struct {
-	double size;   /* множитель размера, 0 = из ini */
+	double em;     /* размер шрифта, как в программе (пиксели), 0 = из меню программы */
 	double lh;     /* интервал, 0 = из меню программы */
 	double side;   /* поля по бокам, pt; -1 = из ini */
 	double indent; /* красная строка, em; -1 = из ini */
 	int loaded;
 } tune = {0, 0, -1, -1, 0};
+static float stock_em; /* что поставила программа (её размер из меню) */
 static struct {
-	double size, lh, side, indent; /* что получилось в последнем CSS — для показа на панели */
+	double lh, side, indent; /* что получилось в последнем CSS — для показа на панели */
 } tune_eff;
 /* последний CSS, который построила программа: в тот же буфер мод пишет новый */
 static struct {
@@ -558,7 +567,7 @@ static void tune_save(void)
 	FILE *f = fopen(TUNE_PATH ".tmp", "w");
 	if (!f)
 		return;
-	fprintf(f, "size=%.2f\nline_height=%.2f\nside=%.0f\nindent=%.2f\n", tune.size, tune.lh, tune.side, tune.indent);
+	fprintf(f, "em=%.1f\nline_height=%.2f\nside=%.0f\nindent=%.2f\n", tune.em, tune.lh, tune.side, tune.indent);
 	fclose(f);
 	rename(TUNE_PATH ".tmp", TUNE_PATH);
 }
@@ -574,8 +583,8 @@ static void tune_load(void)
 	char line[128];
 	double v;
 	while (fgets(line, sizeof line, f)) {
-		if (sscanf(line, "size=%lf", &v) == 1)
-			tune.size = v;
+		if (sscanf(line, "em=%lf", &v) == 1)
+			tune.em = v;
 		else if (sscanf(line, "line_height=%lf", &v) == 1)
 			tune.lh = v;
 		else if (sscanf(line, "side=%lf", &v) == 1)
@@ -597,9 +606,8 @@ static int build_css(char *out, size_t n, const char *dir, const char *name, dou
 	tune_load();
 	if (tune.lh > 0)
 		lh = tune.lh;
-	double size = tune.size > 0 ? tune.size : cfg.size;
+	double size = cfg.size;
 	tune_eff.lh = lh;
-	tune_eff.size = size > 0.3 ? size : 1;
 	tune_eff.side = tune.side >= 0 ? tune.side : 0;
 	tune_eff.indent = tune.indent >= 0 ? tune.indent : (cfg.indent[0] ? atof(cfg.indent) : 0);
 	const char *imp = cfg.force ? " !important" : "";
@@ -2011,6 +2019,23 @@ static const char *status_text(void *obj, const char *text)
 	return NULL;
 }
 
+static int font_hidden(const char *text)
+{
+	size_t n = strlen(text);
+	for (const char *p = cfg.hide_fonts; *p;) {
+		while (*p == ' ' || *p == ',')
+			p++;
+		const char *e = strchr(p, ',');
+		size_t l = e ? (size_t)(e - p) : strlen(p);
+		while (l && p[l - 1] == ' ')
+			l--;
+		if (l && l == n && !strncmp(p, text, n))
+			return 1;
+		p += e ? (size_t)(e - p) : strlen(p);
+	}
+	return 0;
+}
+
 static const char *relabel(void *obj, const char *text, int dynamic)
 {
 	if (!text || !text[0])
@@ -2022,6 +2047,21 @@ static const char *relabel(void *obj, const char *text, int dynamic)
 	const char *r;
 	if (cfg.sort_books && !strcmp(text, "No author books"))
 		return "Без автора";
+	if (font_hidden(text)) {
+		/* пункт меню шрифтов — кнопка, у которой эта подпись внутри */
+		void *(*parent)(const void *) = lv.parent;
+		void (*add_flag)(void *, uint32_t) = dlsym(RTLD_DEFAULT, "lv_obj_add_flag");
+		int (*has_flag)(const void *, uint32_t) = dlsym(RTLD_DEFAULT, "lv_obj_has_flag");
+		void *o = obj;
+		for (int i = 0; o && parent && has_flag && i < 3; i++, o = parent(o))
+			if (has_flag(o, 1u << 1 /* CLICKABLE */)) {
+				add_flag(o, 1u << 0 /* HIDDEN */);
+				if (cfg.debug > 1)
+					logf_("шрифты: «%s» спрятан", text);
+				break;
+			}
+		return text;
+	}
 	if (cfg.text_panel && dynamic >= 0 && !strcmp(text, "Размер шрифта")) {
 		tune_item = obj;
 		return "Текст: размер, интервал";
@@ -2132,6 +2172,13 @@ static void thumbs_start(void);
 #define MUPDF_INIT_VA 0xd3828u
 #define HT_MAKE_BOOKMARK_VA   0x2095ecu /* htdoc_make_bookmark (fb2, epub, html) */
 #define HT_LOOKUP_BOOKMARK_VA 0x209550u /* htdoc_lookup_bookmark */
+/* в открытии fb2/epub адреса этих функций берутся из констант рядом с кодом:
+   ldr rN, [pc, #..]; add rN, pc, rN — подменяем константы, и каждый новый документ
+   (в том числе открытый заново после смены CSS) сразу получает наши закладки */
+#define HT_OPEN_MAKE_ADD_VA   0x20bf58u
+#define HT_OPEN_MAKE_LIT_VA   0x20c090u
+#define HT_OPEN_LOOKUP_ADD_VA 0x20bf64u
+#define HT_OPEN_LOOKUP_LIT_VA 0x20c094u
 /* MuPDF */
 #define FZ_PUSH_TRY_VA      0x158b88u
 #define FZ_DO_TRY_VA        0x158cc4u
@@ -2173,6 +2220,32 @@ static struct {
 	void (*close_dev)(void *, void *), (*drop_dev)(void *, void *);
 } rd;
 
+static intptr_t my_make_bookmark(void *ctx, void *doc, fz_location loc);
+static fz_location my_lookup_bookmark(void *ctx, void *doc, intptr_t mark);
+
+static void bm_patch_open(uintptr_t b)
+{
+#ifdef __linux__
+	uint32_t *lm = (uint32_t *)(b + HT_OPEN_MAKE_LIT_VA), *ll = (uint32_t *)(b + HT_OPEN_LOOKUP_LIT_VA);
+	uint32_t pm = b + HT_OPEN_MAKE_ADD_VA + 8, pl = b + HT_OPEN_LOOKUP_ADD_VA + 8;
+	if (*lm + pm != b + HT_MAKE_BOOKMARK_VA || *ll + pl != b + HT_LOOKUP_BOOKMARK_VA) {
+		logf_("читалка: открытие документа не совпало — закладки только у уже открытых");
+		return;
+	}
+	long pg = sysconf(_SC_PAGESIZE);
+	uintptr_t start = (uintptr_t)lm & ~(uintptr_t)(pg - 1);
+	size_t len = ((uintptr_t)ll + 4 - start + pg - 1) & ~(uintptr_t)(pg - 1);
+	if (mprotect((void *)start, len, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+		logf_("читалка: mprotect: %s", strerror(errno));
+		return;
+	}
+	*lm = (uint32_t)(uintptr_t)my_make_bookmark - pm;
+	*ll = (uint32_t)(uintptr_t)my_lookup_bookmark - pl;
+	mprotect((void *)start, len, PROT_READ | PROT_EXEC);
+	logf_("читалка: закладки по тексту для всех новых документов");
+#endif
+}
+
 static int reader_init(void)
 {
 	static int done;
@@ -2205,6 +2278,7 @@ static int reader_init(void)
 	rd.drop_dev = AT(FZ_DROP_DEV_VA);
 #undef AT
 	rd.app = (char **)(b + APP_PTR_VA);
+	bm_patch_open(b);
 	return 1;
 #else
 	return 0;
@@ -2429,6 +2503,9 @@ static void reader_tick(void)
 #define OPS_SET_CSS_VA 0xd2fb0u /* операции документа: запомнить CSS (app+40) */
 #define OPS_REOPEN_VA  0xd32e4u /* применить CSS: закладка, закрыть и открыть заново */
 #define APP_CSS        40
+#define APP_EM         36       /* размер шрифта (float) */
+#define OPS_SET_FONT_SIZE_SLOT_VA 0xe47234u /* операции документа [36]: размер шрифта (int) */
+#define OPS_SET_FONT_SIZE_VA      0xd3148u
 #define LV_EVENT_ALL 0
 #define LV_EVENT_CLICKED 7
 #define LV_FLAG_HIDDEN (1u << 0)
@@ -2499,7 +2576,7 @@ static const struct {
 	const char *name;
 	double step, lo, hi;
 } tune_rows[TUNE_ROWS] = {
-	{"Размер", 0.05, 0.5, 2.5},
+	{"Размер", 1, 12, 90},
 	{"Интервал", 0.05, 0.8, 2.5},
 	{"Поля по бокам", 4, 0, 120},
 	{"Красная строка", 0.5, 0, 5},
@@ -2517,7 +2594,7 @@ static struct {
 
 static double *tune_slot(int row)
 {
-	return row == 0 ? &tune.size : row == 1 ? &tune.lh : row == 2 ? &tune.side : &tune.indent;
+	return row == 0 ? &tune.em : row == 1 ? &tune.lh : row == 2 ? &tune.side : &tune.indent;
 }
 
 static void panel_show_value(int row)
@@ -2525,7 +2602,7 @@ static void panel_show_value(int row)
 	char t[32];
 	double v = panel.v[row];
 	if (row == 0)
-		snprintf(t, sizeof t, "%.0f%%", v * 100);
+		snprintf(t, sizeof t, "%.0f", v);
 	else if (row == 1)
 		snprintf(t, sizeof t, "%.2f", v);
 	else if (row == 2)
@@ -2552,8 +2629,10 @@ static void tune_apply(void)
 	build_css(css_last.buf, css_last.n, css_last.has_name ? css_last.dir : NULL,
 		css_last.has_name ? css_last.name : NULL, css_last.lh_app);
 	tune_save();
-	logf_("панель: размер %.0f%%, интервал %.2f, поля %.0f, красная строка %.1f",
-		tune_eff.size * 100, tune_eff.lh, tune_eff.side, tune_eff.indent);
+	logf_("панель: размер %.0f, интервал %.2f, поля %.0f, красная строка %.1f",
+		tune.em > 0 ? tune.em : stock_em, tune_eff.lh, tune_eff.side, tune_eff.indent);
+	/* размер — тот же, что ставит меню программы: число в состоянии читалки */
+	*(float *)(app + APP_EM) = tune.em > 0 ? tune.em : stock_em;
 	((void (*)(void))(rd.base + OPS_REOPEN_VA))();
 	clock_gettime(CLOCK_MONOTONIC, &panel.applied);
 }
@@ -2580,7 +2659,7 @@ static void panel_button_cb(void *e)
 		return;
 	}
 	if (a == 101) { /* как в ini */
-		tune.size = tune.lh = 0;
+		tune.em = tune.lh = 0;
 		tune.side = tune.indent = -1;
 		panel.dirty = 1;
 		clock_gettime(CLOCK_MONOTONIC, &panel.changed);
@@ -2647,7 +2726,9 @@ static void panel_open(void)
 			return;
 		}
 	}
-	panel.v[0] = tune_eff.size > 0.3 ? tune_eff.size : 1;
+	if (stock_em <= 0 && reader_init() && *rd.app)
+		stock_em = *(float *)(*rd.app + APP_EM);
+	panel.v[0] = tune.em > 0 ? tune.em : stock_em > 0 ? stock_em : 30;
 	panel.v[1] = tune_eff.lh > 0.5 ? tune_eff.lh : 1.3;
 	panel.v[2] = tune_eff.side;
 	panel.v[3] = tune_eff.indent;
@@ -2758,11 +2839,48 @@ static void item_hook(void)
 			h == label ? "подпись" : "предок", n, (unsigned)item_code);
 }
 
+/* размер шрифта из меню и при открытии книги: свой размер панели главнее */
+static void (*real_set_font_size)(int);
+
+static void my_set_font_size(int px)
+{
+	stock_em = px;
+	real_set_font_size(px);
+	if (tune.em > 0 && rd.app && *rd.app)
+		*(float *)(*rd.app + APP_EM) = tune.em;
+}
+
+static void font_size_hook(void)
+{
+	static int done;
+	if (done || !reader_init())
+		return;
+	done = 1;
+	tune_load();
+	uint32_t *slot = (uint32_t *)(rd.base + OPS_SET_FONT_SIZE_SLOT_VA);
+	if (*slot != rd.base + OPS_SET_FONT_SIZE_VA) {
+		logf_("панель: размер шрифта не там, где ждали — размер панели не работает");
+		return;
+	}
+	real_set_font_size = (void (*)(int))(uintptr_t)*slot;
+	long pg = sysconf(_SC_PAGESIZE);
+	uintptr_t start = (uintptr_t)slot & ~(uintptr_t)(pg - 1);
+	if (mprotect((void *)start, pg, PROT_READ | PROT_WRITE)) {
+		logf_("панель: mprotect: %s", strerror(errno));
+		return;
+	}
+	/* таблица лежит рядом с изменяемыми данными программы — запись не отключаем */
+	*slot = (uint32_t)(uintptr_t)my_set_font_size;
+	if (*rd.app)
+		stock_em = *(float *)(*rd.app + APP_EM);
+}
+
 /* из lv_timer_handler: поставить обработчик на новый пункт меню, применить изменения */
 static void panel_tick(void)
 {
 	if (!cfg.text_panel)
 		return;
+	font_size_hook();
 	if (tune_item)
 		item_hook();
 	if (panel.dirty && since_ms(&panel.changed) > 700 && since_ms(&panel.applied) > 2500) {
@@ -4041,6 +4159,26 @@ static void sleep_cover_for(const char *path)
 
 /* ---------- старт ---------- */
 
+/* падение программы: где именно (адреса в программе и в моде) — в журнал, дальше как обычно */
+static void crash_handler(int sig, siginfo_t *si, void *uc_)
+{
+#ifdef __arm__
+	ucontext_t *uc = uc_;
+	uintptr_t pc = uc->uc_mcontext.arm_pc, lr = uc->uc_mcontext.arm_lr;
+	Dl_info a = {0}, b = {0};
+	dladdr((void *)pc, &a);
+	dladdr((void *)lr, &b);
+	logf_("ПАДЕНИЕ: сигнал %d, адрес %p, pc %s+%#lx, lr %s+%#lx", sig, si->si_addr,
+		a.dli_fname ? a.dli_fname : "?", (unsigned long)(pc - (uintptr_t)a.dli_fbase),
+		b.dli_fname ? b.dli_fname : "?", (unsigned long)(lr - (uintptr_t)b.dli_fbase));
+#else
+	(void)si; (void)uc_;
+	logf_("ПАДЕНИЕ: сигнал %d", sig);
+#endif
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 __attribute__((constructor)) static void luma_init(void)
 {
 	/* LD_PRELOAD наследуют все команды, которые программа запускает (system, popen) —
@@ -4067,6 +4205,12 @@ __attribute__((constructor)) static void luma_init(void)
 	if (cfg.thumbs || cfg.sort_books)
 		thumbs_start();
 	logf_("libluma запущен");
+	struct sigaction sa = {0};
+	sa.sa_sigaction = crash_handler;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGILL, &sa, NULL);
 
 	patch_margins();
 }
