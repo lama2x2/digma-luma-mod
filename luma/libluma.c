@@ -128,6 +128,7 @@ static struct {
 	int thumbs;         /* 1 = миниатюры в меню из обложки книги, а не с экрана */
 	int sort_books;     /* 1 = сортировка библиотеки по настоящим названиям и авторам */
 	int text_anchor;    /* 1 = после смены размера, интервала, полей — страница с тем же текстом */
+	int text_panel;     /* 1 = пункт меню «Размер шрифта» открывает панель «Текст» с − / + */
 } cfg;
 
 static void logf_(const char *fmt, ...)
@@ -193,6 +194,8 @@ static void ini_set(const char *sec, const char *key, char *val)
 	} else if (!strcmp(sec, "text")) {
 		if (!strcmp(key, "global")) {
 			cfg.text_global = atoi(val);
+		} else if (!strcmp(key, "panel")) {
+			cfg.text_panel = atoi(val);
 		} else if (!strcmp(key, "keep_place")) {
 			cfg.text_anchor = atoi(val);
 		} else if (!strcmp(key, "line_spacing")) {
@@ -315,6 +318,7 @@ static void load_ini(void)
 	cfg.menu_values = cfg.status_battery = cfg.status_progress = 1;
 	cfg.buttons_swap = cfg.buttons_toggle = cfg.text_global = cfg.sleep_cover = cfg.thumbs = cfg.sort_books = 1;
 	cfg.text_anchor = 1;
+	cfg.text_panel = 1;
 	static const int total[11] = {0, 1, 2, 3, 5, 8, 12, 18, 27, 40, 60};
 	memcpy(cfg.light_total, total, sizeof total);
 
@@ -526,6 +530,62 @@ static void add_faces(struct sbuf *b, const char *prefix, int remapped)
 	}
 }
 
+/* панель «Текст»: свои значения поверх luma.ini (0 / -1 = как в ini и меню программы).
+   Хранятся в luma/tune.state и действуют во всех книгах */
+#define TUNE_PATH LUMA_DIR "/tune.state"
+static struct {
+	double size;   /* множитель размера, 0 = из ini */
+	double lh;     /* интервал, 0 = из меню программы */
+	double side;   /* поля по бокам, pt; -1 = из ini */
+	double indent; /* красная строка, em; -1 = из ini */
+	int loaded;
+} tune = {0, 0, -1, -1, 0};
+static struct {
+	double size, lh, side, indent; /* что получилось в последнем CSS — для показа на панели */
+} tune_eff;
+/* последний CSS, который построила программа: в тот же буфер мод пишет новый */
+static struct {
+	char *buf;
+	size_t n;
+	char dir[256], name[128];
+	int has_name, valid;
+	double lh_app;
+} css_last;
+static void *tune_item; /* подпись «Размер шрифта» в только что созданном меню читалки */
+
+static void tune_save(void)
+{
+	FILE *f = fopen(TUNE_PATH ".tmp", "w");
+	if (!f)
+		return;
+	fprintf(f, "size=%.2f\nline_height=%.2f\nside=%.0f\nindent=%.2f\n", tune.size, tune.lh, tune.side, tune.indent);
+	fclose(f);
+	rename(TUNE_PATH ".tmp", TUNE_PATH);
+}
+
+static void tune_load(void)
+{
+	if (tune.loaded)
+		return;
+	tune.loaded = 1;
+	FILE *f = fopen(TUNE_PATH, "r");
+	if (!f)
+		return;
+	char line[128];
+	double v;
+	while (fgets(line, sizeof line, f)) {
+		if (sscanf(line, "size=%lf", &v) == 1)
+			tune.size = v;
+		else if (sscanf(line, "line_height=%lf", &v) == 1)
+			tune.lh = v;
+		else if (sscanf(line, "side=%lf", &v) == 1)
+			tune.side = v;
+		else if (sscanf(line, "indent=%lf", &v) == 1)
+			tune.indent = v;
+	}
+	fclose(f);
+}
+
 static int build_css(char *out, size_t n, const char *dir, const char *name, double lh)
 {
 	struct sbuf b = {out, n, 0};
@@ -534,6 +594,14 @@ static int build_css(char *out, size_t n, const char *dir, const char *name, dou
 		int idx = lh < 1.25 ? 0 : lh < 1.75 ? 1 : 2;
 		lh = cfg.line_spacing[idx];
 	}
+	tune_load();
+	if (tune.lh > 0)
+		lh = tune.lh;
+	double size = tune.size > 0 ? tune.size : cfg.size;
+	tune_eff.lh = lh;
+	tune_eff.size = size > 0.3 ? size : 1;
+	tune_eff.side = tune.side >= 0 ? tune.side : 0;
+	tune_eff.indent = tune.indent >= 0 ? tune.indent : (cfg.indent[0] ? atof(cfg.indent) : 0);
 	const char *imp = cfg.force ? " !important" : "";
 	if (name) {
 		const struct font_map *m = font_for_slot(name);
@@ -551,9 +619,11 @@ static int build_css(char *out, size_t n, const char *dir, const char *name, dou
 	sb_add(&b, "html, body, pre { %s margin: 0; padding: 0; line-height: %.2f;}\n",
 	       name ? "font-family: 'MyFont';" : "", lh);
 	sb_add(&b, "img { display: block !important; max-width: 100%%; height: auto; }\n");
-	if (cfg.size > 0.3 && (cfg.size < 0.99 || cfg.size > 1.01))
-		sb_add(&b, "html { font-size: %.0f%%; }\n", cfg.size * 100);
-	if (cfg.side_margin[0])
+	if (size > 0.3 && (size < 0.99 || size > 1.01))
+		sb_add(&b, "html { font-size: %.0f%%; }\n", size * 100);
+	if (tune.side > 0)
+		sb_add(&b, "body { padding: 0 %.0fpt; }\n", tune.side);
+	else if (tune.side < 0 && cfg.side_margin[0])
 		sb_add(&b, "body { padding: 0 %s; }\n", cfg.side_margin);
 	if (cfg.bold)
 		sb_add(&b, "body, p { font-weight: bold%s; }\n", imp);
@@ -562,7 +632,9 @@ static int build_css(char *out, size_t n, const char *dir, const char *name, dou
 		if (name)
 			sb_add(&b, "p, div, li, span, blockquote { font-family: 'MyFont' !important; }\n");
 	}
-	if (cfg.indent[0])
+	if (tune.indent >= 0)
+		sb_add(&b, "p { text-indent: %.2fem%s; }\n", tune.indent, imp);
+	else if (cfg.indent[0])
 		sb_add(&b, "p { text-indent: %s%s; }\n", cfg.indent, imp);
 	if (cfg.para_spacing[0])
 		sb_add(&b, "p { margin-top: 0%s; margin-bottom: %s%s; }\n", imp, cfg.para_spacing, imp);
@@ -580,6 +652,25 @@ static int build_css(char *out, size_t n, const char *dir, const char *name, dou
 	return (int)b.len;
 }
 
+/* CSS строит сама программа (открытие книги, меню) — запоминаем, чтобы панель могла
+   перестроить его с новыми значениями. Выбрали другой интервал в меню — свой интервал панели сбрасываем */
+static void css_remember(char *str, size_t size, const char *dir, const char *name, double lh)
+{
+	tune_load();
+	if (css_last.valid && fabs(lh - css_last.lh_app) > 0.001 && tune.lh > 0) {
+		logf_("текст: в меню выбран другой интервал — свой (%.2f) сброшен", tune.lh);
+		tune.lh = 0;
+		tune_save();
+	}
+	css_last.buf = str;
+	css_last.n = size;
+	css_last.has_name = name != NULL;
+	copy(css_last.dir, sizeof css_last.dir, dir ? dir : "");
+	copy(css_last.name, sizeof css_last.name, name ? name : "");
+	css_last.lh_app = lh;
+	css_last.valid = 1;
+}
+
 int snprintf(char *str, size_t size, const char *fmt, ...)
 {
 	resolve();
@@ -592,11 +683,13 @@ int snprintf(char *str, size_t size, const char *fmt, ...)
 			const char *name = va_arg(ap, const char *);
 			double lh = va_arg(ap, double);
 			va_end(ap);
+			css_remember(str, size, dir, name, lh);
 			return build_css(str, size, dir, name, lh);
 		}
 		if (!strncmp(fmt, CSS_FMT_PLAIN, sizeof CSS_FMT_PLAIN - 1)) {
 			double lh = va_arg(ap, double);
 			va_end(ap);
+			css_remember(str, size, NULL, NULL, lh);
 			return build_css(str, size, NULL, NULL, lh);
 		}
 	}
@@ -1929,6 +2022,10 @@ static const char *relabel(void *obj, const char *text, int dynamic)
 	const char *r;
 	if (cfg.sort_books && !strcmp(text, "No author books"))
 		return "Без автора";
+	if (cfg.text_panel && dynamic >= 0 && !strcmp(text, "Размер шрифта")) {
+		tune_item = obj;
+		return "Текст: размер, интервал";
+	}
 	if (cfg.menu_values && (r = menu_value(text)))
 		return r;
 	if (dynamic && (r = status_text(obj, text)))
@@ -2061,6 +2158,7 @@ typedef struct { int chapter, page; } fz_location;
 
 static struct {
 	char **app;
+	uintptr_t base;
 	uintptr_t make, lookup; /* штатные функции закладок */
 	sigjmp_buf *(*push_try)(void *);
 	int (*do_try)(void *), (*do_catch)(void *);
@@ -2089,6 +2187,7 @@ static int reader_init(void)
 		return 0;
 	}
 #define AT(va) ((void *)(b + (va)))
+	rd.base = b;
 	rd.make = b + HT_MAKE_BOOKMARK_VA;
 	rd.lookup = b + HT_LOOKUP_BOOKMARK_VA;
 	rd.push_try = AT(FZ_PUSH_TRY_VA);
@@ -2180,6 +2279,8 @@ static struct {
 	int alen, ach;
 	double afrac;          /* где якорь в главе (доля) — если закладка Digma не нашлась */
 	int lch, lpg, landed;  /* куда открыли после прошлой перестройки */
+	int reopened;          /* документ открыт заново (интервал): страница Digma не в счёт */
+	int pending;           /* закладку сделали, поиска ещё не было */
 	struct timespec made;  /* когда делали закладку */
 } anc = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -2243,7 +2344,14 @@ static intptr_t my_make_bookmark(void *ctx, void *doc, fz_location loc)
 {
 	pthread_mutex_lock(&anc.mu);
 	int same = anc.alen && anc.doc == doc && anc.book == book_opens;
-	if (!(same && anc.landed && anc.lch == loc.chapter && anc.lpg == loc.page)) {
+	/* смена интервала: программа открывает книгу заново, переходит на тот же номер страницы
+	   ещё без наших закладок и потом перестраивает уже новый документ. Якорь — со старого */
+	int reopen = anc.alen && anc.doc != doc && anc.book == book_opens && anc.pending && since_ms(&anc.made) < 10000;
+	if (reopen) {
+		anc.reopened = 1;
+		if (cfg.debug > 1)
+			logf_("место: книга открыта заново, якорь прежний, страница %d", loc.page);
+	} else if (!(same && anc.landed && anc.lch == loc.chapter && anc.lpg == loc.page)) {
 		/* читатель перелистнул (или первая перестройка) — новый якорь */
 		int n = page_chars(ctx, doc, loc.chapter, loc.page, anc.a, ANCHOR);
 		int count = chapter_pages(ctx, doc, loc.chapter);
@@ -2251,11 +2359,14 @@ static intptr_t my_make_bookmark(void *ctx, void *doc, fz_location loc)
 		anc.ach = loc.chapter;
 		anc.afrac = count > 0 ? (double)loc.page / count : 0;
 		anc.landed = 0;
+		anc.reopened = 0;
 		if (anc.alen && cfg.debug > 1)
 			anchor_log("якорь", loc.chapter, loc.page, count);
 	}
 	anc.doc = doc;
 	anc.book = book_opens;
+	anc.landed = 0;  /* поиск после перестройки поставит снова */
+	anc.pending = 1;
 	clock_gettime(CLOCK_MONOTONIC, &anc.made);
 	pthread_mutex_unlock(&anc.mu);
 	return ((intptr_t (*)(void *, void *, fz_location))rd.make)(ctx, doc, loc);
@@ -2266,11 +2377,13 @@ static fz_location my_lookup_bookmark(void *ctx, void *doc, intptr_t mark)
 {
 	fz_location loc = ((fz_location (*)(void *, void *, intptr_t))rd.lookup)(ctx, doc, mark);
 	pthread_mutex_lock(&anc.mu);
-	/* та же книга и закладку делали только что (документ мог открыться заново) */
-	if (cfg.text_anchor && anc.alen && anc.book == book_opens && (anc.doc == doc || since_ms(&anc.made) < 10000)) {
+	/* только первый поиск после нашей закладки: следом программа ищет закладки читателя,
+	   их не трогаем. Документ мог открыться заново — тогда закладку делали только что */
+	if (cfg.text_anchor && anc.pending && anc.alen && anc.book == book_opens && (anc.doc == doc || since_ms(&anc.made) < 10000)) {
 		int ch = loc.page >= 0 && loc.chapter == anc.ach ? loc.chapter : anc.ach;
 		int count = chapter_pages(ctx, doc, ch), to = -1;
-		int est = ch == loc.chapter && loc.page >= 0 ? loc.page : (int)(anc.afrac * count + 0.5);
+		int est = ch == loc.chapter && loc.page >= 0 && !anc.reopened ? loc.page : (int)(anc.afrac * count + 0.5);
+		anc.reopened = 0;
 		if (count > 0 && find_anchor(ctx, doc, est, count, &to)) {
 			if (to != loc.page || ch != loc.chapter)
 				logf_("место: после перестройки страница %d -> %d (из %d), по тексту", loc.page, to, count);
@@ -2283,6 +2396,7 @@ static fz_location my_lookup_bookmark(void *ctx, void *doc, intptr_t mark)
 		anc.lpg = loc.page;
 		anc.landed = 1;
 	}
+	anc.pending = 0;
 	pthread_mutex_unlock(&anc.mu);
 	return loc;
 }
@@ -2307,6 +2421,362 @@ static void reader_tick(void)
 	pthread_mutex_unlock(mu);
 }
 
+/* ---------- панель «Текст» ----------
+   Пункт «Размер шрифта» в меню читалки открывает свою панель: размер, интервал, поля по бокам,
+   красная строка — каждая строка с − значение +. Панель не закрывается после нажатия:
+   через долю секунды после последнего нажатия мод перестраивает CSS и программа открывает
+   книгу заново (как после выбора в меню), место держится по тексту. Тап мимо панели — закрыть. */
+#define OPS_SET_CSS_VA 0xd2fb0u /* операции документа: запомнить CSS (app+40) */
+#define OPS_REOPEN_VA  0xd32e4u /* применить CSS: закладка, закрыть и открыть заново */
+#define APP_CSS        40
+#define LV_EVENT_ALL 0
+#define LV_EVENT_CLICKED 7
+#define LV_FLAG_HIDDEN (1u << 0)
+#define LV_FLAG_CLICKABLE (1u << 1)
+#define LV_FLAG_SCROLLABLE (1u << 4)
+
+typedef struct { uint8_t blue, green, red; } lv_color_t;
+typedef struct { void *cb, *user_data; uint32_t filter; } ev_dsc_t;
+
+static struct {
+	int ok;
+	void *(*obj_create)(void *), *(*label_create)(void *), *(*button_create)(void *);
+	void *(*layer_top)(void);
+	void (*obj_delete)(void *);
+	void (*set_size)(void *, int32_t, int32_t), (*set_pos)(void *, int32_t, int32_t);
+	void (*remove_style_all)(void *);
+	void (*add_flag)(void *, uint32_t), (*remove_flag)(void *, uint32_t);
+	int (*has_flag)(const void *, uint32_t);
+	void *(*add_event_cb)(void *, void (*)(void *), uint32_t, void *);
+	uint32_t (*event_count)(const void *);
+	ev_dsc_t *(*event_dsc)(const void *, uint32_t);
+	int (*remove_event)(void *, uint32_t);
+	uint32_t (*ev_code)(void *);
+	void *(*ev_target)(void *), *(*ev_user)(void *);
+	void (*ev_stop)(void *), (*ev_stop_bubbling)(void *);
+	void (*bg_color)(void *, lv_color_t, uint32_t), (*bg_opa)(void *, uint8_t, uint32_t);
+	void (*border_color)(void *, lv_color_t, uint32_t), (*border_width)(void *, int32_t, uint32_t);
+	void (*radius)(void *, int32_t, uint32_t), (*text_color)(void *, lv_color_t, uint32_t);
+	void (*text_font)(void *, const void *, uint32_t), (*text_align)(void *, int, uint32_t);
+	void (*center)(void *);
+	int32_t (*hor_res)(void *), (*ver_res)(void *);
+	uint32_t (*child_count)(const void *);
+	void *(*font_create)(const char *, int, uint32_t, int);
+} ui;
+
+static int ui_init(void)
+{
+	static int done;
+	if (done)
+		return ui.ok;
+	done = 1;
+#define S(f, n) if (!(*(void **)&ui.f = dlsym(RTLD_DEFAULT, n))) { logf_("панель: нет %s", n); return 0; }
+	S(obj_create, "lv_obj_create") S(label_create, "lv_label_create") S(button_create, "lv_button_create")
+	S(layer_top, "lv_layer_top") S(obj_delete, "lv_obj_delete")
+	S(set_size, "lv_obj_set_size") S(set_pos, "lv_obj_set_pos") S(remove_style_all, "lv_obj_remove_style_all")
+	S(add_flag, "lv_obj_add_flag") S(remove_flag, "lv_obj_remove_flag") S(has_flag, "lv_obj_has_flag")
+	S(add_event_cb, "lv_obj_add_event_cb") S(event_count, "lv_obj_get_event_count")
+	S(event_dsc, "lv_obj_get_event_dsc") S(remove_event, "lv_obj_remove_event")
+	S(ev_code, "lv_event_get_code") S(ev_target, "lv_event_get_target") S(ev_user, "lv_event_get_user_data")
+	S(ev_stop, "lv_event_stop_processing") S(ev_stop_bubbling, "lv_event_stop_bubbling")
+	S(bg_color, "lv_obj_set_style_bg_color") S(bg_opa, "lv_obj_set_style_bg_opa")
+	S(border_color, "lv_obj_set_style_border_color") S(border_width, "lv_obj_set_style_border_width")
+	S(radius, "lv_obj_set_style_radius") S(text_color, "lv_obj_set_style_text_color")
+	S(text_font, "lv_obj_set_style_text_font") S(text_align, "lv_obj_set_style_text_align")
+	S(center, "lv_obj_center")
+	S(hor_res, "lv_display_get_horizontal_resolution") S(ver_res, "lv_display_get_vertical_resolution")
+	S(child_count, "lv_obj_get_child_count") S(font_create, "lv_freetype_font_create")
+#undef S
+	resolve();
+	ui.ok = lv.is_valid && lv.parent && lv.get_screen;
+	return ui.ok;
+}
+
+static const lv_color_t BLACK = {0, 0, 0}, WHITE = {255, 255, 255};
+
+#define TUNE_ROWS 4
+static const struct {
+	const char *name;
+	double step, lo, hi;
+} tune_rows[TUNE_ROWS] = {
+	{"Размер", 0.05, 0.5, 2.5},
+	{"Интервал", 0.05, 0.8, 2.5},
+	{"Поля по бокам", 4, 0, 120},
+	{"Красная строка", 0.5, 0, 5},
+};
+
+static struct {
+	void *backdrop;  /* панель открыта */
+	void *menu;      /* спрятанное на время меню программы */
+	void *value[TUNE_ROWS];
+	double v[TUNE_ROWS];
+	const void *font, *font_big;
+	int dirty;
+	struct timespec changed, applied;
+} panel;
+
+static double *tune_slot(int row)
+{
+	return row == 0 ? &tune.size : row == 1 ? &tune.lh : row == 2 ? &tune.side : &tune.indent;
+}
+
+static void panel_show_value(int row)
+{
+	char t[32];
+	double v = panel.v[row];
+	if (row == 0)
+		snprintf(t, sizeof t, "%.0f%%", v * 100);
+	else if (row == 1)
+		snprintf(t, sizeof t, "%.2f", v);
+	else if (row == 2)
+		snprintf(t, sizeof t, "%.0f", v);
+	else
+		snprintf(t, sizeof t, "%.1f", v);
+	if (panel.value[row])
+		real_label_set_text(panel.value[row], t);
+}
+
+/* применить: CSS в тот же буфер программы и «открыть заново», как после выбора в меню */
+static void tune_apply(void)
+{
+	if (!reader_init() || !*rd.app)
+		return;
+	char *app = *rd.app;
+	if (!*(void **)(app + APP_DOC))
+		return;
+	if (!css_last.valid || *(char **)(app + APP_CSS) != css_last.buf) {
+		logf_("панель: CSS программы не там, где ждали (%p, у нас %p) — не применяю",
+			*(void **)(app + APP_CSS), (void *)css_last.buf);
+		return;
+	}
+	build_css(css_last.buf, css_last.n, css_last.has_name ? css_last.dir : NULL,
+		css_last.has_name ? css_last.name : NULL, css_last.lh_app);
+	tune_save();
+	logf_("панель: размер %.0f%%, интервал %.2f, поля %.0f, красная строка %.1f",
+		tune_eff.size * 100, tune_eff.lh, tune_eff.side, tune_eff.indent);
+	((void (*)(void))(rd.base + OPS_REOPEN_VA))();
+	clock_gettime(CLOCK_MONOTONIC, &panel.applied);
+}
+
+static void panel_close(void)
+{
+	if (panel.backdrop && lv.is_valid(panel.backdrop))
+		ui.obj_delete(panel.backdrop);
+	panel.backdrop = NULL;
+	for (int i = 0; i < TUNE_ROWS; i++)
+		panel.value[i] = NULL;
+	/* меню программы возвращаем как было */
+	if (panel.menu && lv.is_valid(panel.menu))
+		ui.remove_flag(panel.menu, LV_FLAG_HIDDEN);
+	panel.menu = NULL;
+}
+
+static void panel_button_cb(void *e)
+{
+	intptr_t a = (intptr_t)ui.ev_user(e);
+	if (a == 100) { /* мимо панели */
+		if (ui.ev_target(e) == panel.backdrop)
+			panel_close();
+		return;
+	}
+	if (a == 101) { /* как в ini */
+		tune.size = tune.lh = 0;
+		tune.side = tune.indent = -1;
+		panel.dirty = 1;
+		clock_gettime(CLOCK_MONOTONIC, &panel.changed);
+		panel_close();
+		return;
+	}
+	if (a == 102) {
+		panel_close();
+		return;
+	}
+	int row = a / 2, dir = a % 2 ? 1 : -1;
+	if (row < 0 || row >= TUNE_ROWS)
+		return;
+	double v = panel.v[row] + dir * tune_rows[row].step;
+	if (v < tune_rows[row].lo - 1e-9 || v > tune_rows[row].hi + 1e-9)
+		return;
+	v = round(v / tune_rows[row].step) * tune_rows[row].step;
+	panel.v[row] = v;
+	*tune_slot(row) = v;
+	panel_show_value(row);
+	panel.dirty = 1;
+	clock_gettime(CLOCK_MONOTONIC, &panel.changed);
+}
+
+static void *ui_label(void *parent, const char *text, const void *font)
+{
+	void *l = ui.label_create(parent);
+	ui.text_font(l, font, 0);
+	ui.text_color(l, BLACK, 0);
+	real_label_set_text(l, text);
+	return l;
+}
+
+static void *ui_button(void *parent, int x, int y, int w, int h, const char *text, intptr_t act)
+{
+	void *b = ui.button_create(parent);
+	ui.remove_style_all(b);
+	ui.set_pos(b, x, y);
+	ui.set_size(b, w, h);
+	ui.bg_color(b, WHITE, 0);
+	ui.bg_opa(b, 255, 0);
+	ui.border_color(b, BLACK, 0);
+	ui.border_width(b, 2, 0);
+	ui.radius(b, 10, 0);
+	void *l = ui_label(b, text, panel.font_big);
+	ui.center(l);
+	ui.add_event_cb(b, panel_button_cb, LV_EVENT_CLICKED, (void *)act);
+	return b;
+}
+
+static void panel_open(void)
+{
+	if (panel.backdrop || !ui_init())
+		return;
+	if (!panel.font) {
+		static const char *const fonts[] = {"/opt/ylc-ebook/fonts/NotoSans.ttf", "/opt/ylc-ebook/fonts/Arial.ttf"};
+		for (unsigned i = 0; i < 2 && !panel.font; i++)
+			if (file_exists(fonts[i])) {
+				panel.font = ui.font_create(fonts[i], 0, 30, 0);
+				panel.font_big = ui.font_create(fonts[i], 0, 44, 0);
+			}
+		if (!panel.font || !panel.font_big) {
+			logf_("панель: не удалось открыть шрифт");
+			return;
+		}
+	}
+	panel.v[0] = tune_eff.size > 0.3 ? tune_eff.size : 1;
+	panel.v[1] = tune_eff.lh > 0.5 ? tune_eff.lh : 1.3;
+	panel.v[2] = tune_eff.side;
+	panel.v[3] = tune_eff.indent;
+	int W = ui.hor_res(NULL), H = ui.ver_res(NULL);
+	int rowh = 92, ph = rowh * (TUNE_ROWS + 1) + 40;
+	/* подложка во весь экран: тапы мимо панели не листают книгу, а закрывают панель */
+	void *bd = ui.obj_create(ui.layer_top());
+	ui.remove_style_all(bd);
+	ui.set_pos(bd, 0, 0);
+	ui.set_size(bd, W, H);
+	ui.add_flag(bd, LV_FLAG_CLICKABLE);
+	ui.remove_flag(bd, LV_FLAG_SCROLLABLE);
+	ui.add_event_cb(bd, panel_button_cb, LV_EVENT_CLICKED, (void *)100);
+	panel.backdrop = bd;
+	void *p = ui.obj_create(bd);
+	ui.remove_style_all(p);
+	ui.set_pos(p, 0, H - ph);
+	ui.set_size(p, W, ph);
+	ui.bg_color(p, WHITE, 0);
+	ui.bg_opa(p, 255, 0);
+	ui.border_color(p, BLACK, 0);
+	ui.border_width(p, 3, 0);
+	ui.add_flag(p, LV_FLAG_CLICKABLE); /* тап по самой панели — не закрывать */
+	ui.remove_flag(p, LV_FLAG_SCROLLABLE);
+	int bw = 110, vw = 130, x_plus = W - 24 - bw, x_val = x_plus - vw, x_minus = x_val - bw;
+	for (int i = 0; i < TUNE_ROWS; i++) {
+		int y = 20 + i * rowh;
+		void *name = ui_label(p, tune_rows[i].name, panel.font);
+		ui.set_pos(name, 24, y + 22);
+		ui_button(p, x_minus, y + 6, bw, rowh - 16, "−", i * 2);
+		void *v = ui_label(p, "", panel.font);
+		ui.set_size(v, vw, 40);
+		ui.set_pos(v, x_val, y + 22);
+		ui.text_align(v, 2 /* LV_TEXT_ALIGN_CENTER */, 0);
+		panel.value[i] = v;
+		panel_show_value(i);
+		ui_button(p, x_plus, y + 6, bw, rowh - 16, "+", i * 2 + 1);
+	}
+	int y = 20 + TUNE_ROWS * rowh;
+	ui_button(p, 24, y + 6, (W - 72) / 2, rowh - 16, "Как в ini", 101);
+	ui_button(p, 48 + (W - 72) / 2, y + 6, (W - 72) / 2, rowh - 16, "Готово", 102);
+	logf_("панель: открыта");
+}
+
+/* пункт меню «Размер шрифта» -> панель. Обработчик ставим первым и дальше не пускаем,
+   остальные пункты меню работают как были */
+static uint32_t item_code = LV_EVENT_CLICKED;
+
+static void item_cb(void *e)
+{
+	if (ui.ev_code(e) != item_code)
+		return;
+	void *label = ui.ev_user(e), *t = ui.ev_target(e);
+	if (!lv.is_valid(label))
+		return;
+	int hit = 0;
+	for (void *o = label; o && !hit; o = lv.parent(o))
+		hit = o == t;
+	if (!hit)
+		return;
+	ui.ev_stop(e);
+	ui.ev_stop_bubbling(e);
+	/* меню программы прячем, чтобы видеть страницу: самый верхний предок, у которого есть соседи */
+	void *menu = NULL;
+	for (void *o = label; o && lv.parent(o); o = lv.parent(o))
+		if (ui.child_count(lv.parent(o)) > 1)
+			menu = o;
+	if (menu && menu != lv.get_screen(label) && ui.child_count(lv.get_screen(label)) > 1) {
+		ui.add_flag(menu, LV_FLAG_HIDDEN);
+		panel.menu = menu;
+	}
+	panel_open();
+}
+
+static void item_hook(void)
+{
+	void *label = tune_item;
+	tune_item = NULL;
+	if (!ui_init() || !lv.is_valid(label))
+		return;
+	void *h = label;
+	for (int i = 0; h && i < 4 && !ui.event_count(h); i++)
+		h = lv.parent(h);
+	if (!h || !ui.event_count(h)) {
+		logf_("панель: у пункта меню нет обработчика");
+		return;
+	}
+	ev_dsc_t d[8];
+	int n = ui.event_count(h);
+	if (n > 8)
+		n = 8;
+	for (int i = 0; i < n; i++)
+		d[i] = *ui.event_dsc(h, i);
+	for (int i = 0; i < n; i++)
+		if (d[i].cb == (void *)item_cb)
+			return; /* уже стоит */
+	for (int i = n - 1; i >= 0; i--)
+		ui.remove_event(h, i);
+	ui.add_event_cb(h, item_cb, LV_EVENT_ALL, label);
+	item_code = LV_EVENT_CLICKED;
+	for (int i = 0; i < n; i++) {
+		ui.add_event_cb(h, d[i].cb, d[i].filter, d[i].user_data);
+		if (d[i].filter && d[i].filter != LV_EVENT_ALL && i == 0)
+			item_code = d[i].filter;
+	}
+	if (cfg.debug > 1)
+		logf_("панель: пункт меню %p, обработчик на %p (%s), событий %d, код %u", label, h,
+			h == label ? "подпись" : "предок", n, (unsigned)item_code);
+}
+
+/* из lv_timer_handler: поставить обработчик на новый пункт меню, применить изменения */
+static void panel_tick(void)
+{
+	if (!cfg.text_panel)
+		return;
+	if (tune_item)
+		item_hook();
+	if (panel.dirty && since_ms(&panel.changed) > 700 && since_ms(&panel.applied) > 2500) {
+		if (!reader_init() || !*rd.app)
+			return;
+		pthread_mutex_t *mu = (pthread_mutex_t *)(*rd.app + APP_MUTEX);
+		if (pthread_mutex_trylock(mu))
+			return; /* программа ещё занята прошлой перестройкой */
+		pthread_mutex_unlock(mu);
+		panel.dirty = 0;
+		tune_apply();
+	}
+}
+
 uint32_t lv_timer_handler(void)
 {
 	static uint32_t (*real)(void);
@@ -2318,6 +2788,7 @@ uint32_t lv_timer_handler(void)
 	static unsigned watch;
 	if (!(++watch & 7))
 		reader_tick();
+	panel_tick();
 	/* драйвер мог переписать импульс (сон, смена режима) — возвращаем свой */
 	static unsigned tick;
 	if (cfg.light_ticks && !(++tick & 31)) {

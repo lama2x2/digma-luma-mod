@@ -53,6 +53,19 @@ test-mod)
 	# остановлена: файлы кладём через диск, модуль — в память книги, мод стартует после отключения
 	need_device
 	[ -f luma/build/libluma.so ] || { echo "Сначала собери модуль: ./luma/build.sh"; exit 1; }
+	R=/dev/shm/luma-test
+	# прошивка уже с модом: подменяем только модуль (до перезагрузки)
+	if adb shell 'grep -q "Luma mod" /opt/ylc-ebook/bin/ylc-daemon.sh'; then
+		# программу останавливаем: занятую подмену не снять. /dev/shm смонтирован с noexec —
+		# без exec модуль молча не загрузится, и программа пойдёт без мода
+		adb shell "/etc/init.d/S99YlcDaemon stop >/dev/null 2>&1; $WAIT_EXIT; mkdir -p $R
+			while mountpoint -q /opt/luma/libluma.so 2>/dev/null || grep -q ' /opt/luma/libluma.so ' /proc/mounts; do umount /opt/luma/libluma.so || break; done
+			mount -o remount,exec /dev/shm"
+		adb push luma/build/libluma.so $R/libluma.so >/dev/null
+		adb shell "mount --bind $R/libluma.so /opt/luma/libluma.so" || exit 1
+		echo "Модуль подменён до перезагрузки. Запуск: ./luma.sh live"
+		exit 0
+	fi
 	[ -d "$VOL" ] || { echo "Нет диска $VOL: включи на книге режим USB."; exit 1; }
 	tmp=$(mktemp -d)
 	adb exec-out "cat /opt/ylc-ebook/bin/ylc-ebook" > "$tmp/ylc-ebook.orig"
@@ -67,7 +80,6 @@ test-mod)
 	if [ ! -f "$VOL/luma/luma.ini" ]; then
 		sed 's|/opt/luma/fonts/|/userdata/luma/fonts/|' luma/luma.ini > "$VOL/luma/luma.ini"
 	fi
-	R=/dev/shm/luma-test
 	adb shell "mkdir -p $R"
 	adb push "$tmp/ylc-ebook" "$tmp/ylc-daemon.sh.mod" luma/build/libluma.so luma/test-run.sh $R/ >/dev/null
 	rm -rf "$tmp"
