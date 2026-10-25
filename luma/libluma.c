@@ -2179,6 +2179,10 @@ static void thumbs_start(void);
 #define HT_OPEN_MAKE_LIT_VA   0x20c090u
 #define HT_OPEN_LOOKUP_ADD_VA 0x20bf64u
 #define HT_OPEN_LOOKUP_LIT_VA 0x20c094u
+#define HT_LAYOUT_VA          0x20a544u /* htdoc_layout */
+#define HT_OPEN_LAYOUT_ADD_VA 0x20bf4cu
+#define HT_OPEN_LAYOUT_LIT_VA 0x20c08cu
+#define APP_FLAT_PAGE 220 /* номер страницы подряд по всем главам: с него открывается книга заново */
 /* MuPDF */
 #define FZ_PUSH_TRY_VA      0x158b88u
 #define FZ_DO_TRY_VA        0x158cc4u
@@ -2198,6 +2202,7 @@ static void thumbs_start(void);
 #define APP_MUTEX     48
 #define DOC_MAKE_BOOKMARK   8   /* в fz_document, указатели на функции */
 #define DOC_LOOKUP_BOOKMARK 9
+#define DOC_DID_LAYOUT      22  /* int: разметка сделана */
 
 typedef struct { float x0, y0, x1, y1; } fz_rect;
 typedef struct { float a, b, c, d, e, f; } fz_matrix;
@@ -2222,18 +2227,20 @@ static struct {
 
 static intptr_t my_make_bookmark(void *ctx, void *doc, fz_location loc);
 static fz_location my_lookup_bookmark(void *ctx, void *doc, intptr_t mark);
+static void my_layout(void *ctx, void *doc, float w, float h, float em);
 
 static void bm_patch_open(uintptr_t b)
 {
 #ifdef __linux__
 	uint32_t *lm = (uint32_t *)(b + HT_OPEN_MAKE_LIT_VA), *ll = (uint32_t *)(b + HT_OPEN_LOOKUP_LIT_VA);
-	uint32_t pm = b + HT_OPEN_MAKE_ADD_VA + 8, pl = b + HT_OPEN_LOOKUP_ADD_VA + 8;
-	if (*lm + pm != b + HT_MAKE_BOOKMARK_VA || *ll + pl != b + HT_LOOKUP_BOOKMARK_VA) {
+	uint32_t *ly = (uint32_t *)(b + HT_OPEN_LAYOUT_LIT_VA);
+	uint32_t pm = b + HT_OPEN_MAKE_ADD_VA + 8, pl = b + HT_OPEN_LOOKUP_ADD_VA + 8, py = b + HT_OPEN_LAYOUT_ADD_VA + 8;
+	if (*lm + pm != b + HT_MAKE_BOOKMARK_VA || *ll + pl != b + HT_LOOKUP_BOOKMARK_VA || *ly + py != b + HT_LAYOUT_VA) {
 		logf_("читалка: открытие документа не совпало — закладки только у уже открытых");
 		return;
 	}
 	long pg = sysconf(_SC_PAGESIZE);
-	uintptr_t start = (uintptr_t)lm & ~(uintptr_t)(pg - 1);
+	uintptr_t start = (uintptr_t)ly & ~(uintptr_t)(pg - 1);
 	size_t len = ((uintptr_t)ll + 4 - start + pg - 1) & ~(uintptr_t)(pg - 1);
 	if (mprotect((void *)start, len, PROT_READ | PROT_WRITE | PROT_EXEC)) {
 		logf_("читалка: mprotect: %s", strerror(errno));
@@ -2241,6 +2248,7 @@ static void bm_patch_open(uintptr_t b)
 	}
 	*lm = (uint32_t)(uintptr_t)my_make_bookmark - pm;
 	*ll = (uint32_t)(uintptr_t)my_lookup_bookmark - pl;
+	*ly = (uint32_t)(uintptr_t)my_layout - py;
 	mprotect((void *)start, len, PROT_READ | PROT_EXEC);
 	logf_("читалка: закладки по тексту для всех новых документов");
 #endif
@@ -2353,6 +2361,7 @@ static struct {
 	int alen, ach;
 	double afrac;          /* где якорь в главе (доля) — если закладка Digma не нашлась */
 	int lch, lpg, landed;  /* куда открыли после прошлой перестройки */
+	double mfrac;          /* где была страница в главе (доля) при последней закладке */
 	int reopened;          /* документ открыт заново (интервал): страница Digma не в счёт */
 	int pending;           /* закладку сделали, поиска ещё не было */
 	struct timespec made;  /* когда делали закладку */
@@ -2416,6 +2425,9 @@ static int find_anchor(void *ctx, void *doc, int est, int count, int *found)
 /* закладка перед перестройкой: запоминаем начало страницы, вёрстка ещё старая */
 static intptr_t my_make_bookmark(void *ctx, void *doc, fz_location loc)
 {
+	if (cfg.debug > 2)
+		logf_("закладка: make doc %p (наш %p) %d/%d, поток %lx, ждём %d, на месте %d %d/%d, книга %d/%d", doc, anc.doc,
+			loc.chapter, loc.page, (unsigned long)pthread_self(), anc.pending, anc.landed, anc.lch, anc.lpg, anc.book, book_opens);
 	pthread_mutex_lock(&anc.mu);
 	int same = anc.alen && anc.doc == doc && anc.book == book_opens;
 	/* смена интервала: программа открывает книгу заново, переходит на тот же номер страницы
@@ -2437,6 +2449,10 @@ static intptr_t my_make_bookmark(void *ctx, void *doc, fz_location loc)
 		if (anc.alen && cfg.debug > 1)
 			anchor_log("якорь", loc.chapter, loc.page, count);
 	}
+	{
+		int count = chapter_pages(ctx, doc, loc.chapter);
+		anc.mfrac = count > 0 ? (double)loc.page / count : anc.afrac;
+	}
 	anc.doc = doc;
 	anc.book = book_opens;
 	anc.landed = 0;  /* поиск после перестройки поставит снова */
@@ -2450,6 +2466,9 @@ static intptr_t my_make_bookmark(void *ctx, void *doc, fz_location loc)
 static fz_location my_lookup_bookmark(void *ctx, void *doc, intptr_t mark)
 {
 	fz_location loc = ((fz_location (*)(void *, void *, intptr_t))rd.lookup)(ctx, doc, mark);
+	if (cfg.debug > 2)
+		logf_("закладка: lookup doc %p (наш %p) -> %d/%d, поток %lx, ждём %d, книга %d/%d, прошло %.0f мс", doc, anc.doc,
+			loc.chapter, loc.page, (unsigned long)pthread_self(), anc.pending, anc.book, book_opens, since_ms(&anc.made));
 	pthread_mutex_lock(&anc.mu);
 	/* только первый поиск после нашей закладки: следом программа ищет закладки читателя,
 	   их не трогаем. Документ мог открыться заново — тогда закладку делали только что */
@@ -2473,6 +2492,44 @@ static fz_location my_lookup_bookmark(void *ctx, void *doc, intptr_t mark)
 	anc.pending = 0;
 	pthread_mutex_unlock(&anc.mu);
 	return loc;
+}
+
+/* разметка документа. Новый документ той же книги вскоре после закладки — это открытие
+   заново после смены CSS (интервал, шрифт, панель): программа встанет на страницу с номером
+   app+220, номер ставим по якорю — до того, как программа его прочтёт */
+static void my_layout(void *ctx, void *doc, float w, float h, float em)
+{
+	static __thread int inside;
+	/* только что открытый документ ещё не размечен; адрес у него может совпасть со старым */
+	int fresh = !((int *)doc)[DOC_DID_LAYOUT];
+	((void (*)(void *, void *, float, float, float))(rd.base + HT_LAYOUT_VA))(ctx, doc, w, h, em);
+	if (!cfg.text_anchor || !rd.app || !*rd.app || inside)
+		return;
+	/* fz_layout_document отметит разметку только после нас: без отметки подсчёт страниц
+	   запустил бы разметку заново (и снова нас) */
+	((int *)doc)[DOC_DID_LAYOUT] = 1;
+	inside = 1;
+	pthread_mutex_lock(&anc.mu);
+	if (fresh && anc.alen && anc.doc && anc.book == book_opens && since_ms(&anc.made) < 10000) {
+		int count = chapter_pages(ctx, doc, anc.ach), to = -1;
+		int est = (int)(anc.mfrac * count + 0.5);
+		if (count > 0 && find_anchor(ctx, doc, est, count, &to)) {
+			int flat = to;
+			for (int c = 0; c < anc.ach; c++)
+				flat += chapter_pages(ctx, doc, c);
+			int *fp = (int *)(*rd.app + APP_FLAT_PAGE);
+			logf_("место: книга открыта заново, страница %d -> %d (из %d), по тексту", *fp, flat, count);
+			*fp = flat;
+			anc.lch = anc.ach;
+			anc.lpg = to;
+			anc.landed = 1;
+		} else if (cfg.debug > 1)
+			logf_("место: книга открыта заново, якорь не найден (ищу у %d из %d)", est, count);
+		anc.doc = doc;
+		anc.pending = 0;
+	}
+	pthread_mutex_unlock(&anc.mu);
+	inside = 0;
 }
 
 /* открыли документ — ставим свои закладки (только в fb2/epub/html со штатными функциями Digma) */
@@ -2881,6 +2938,26 @@ static void panel_tick(void)
 	if (!cfg.text_panel)
 		return;
 	font_size_hook();
+	/* отладка без нажатий: echo "em 34" > /dev/shm/luma-test/cmd (em, lh, side, indent) */
+	static unsigned cmd_tick;
+	if (cfg.debug > 2 && !(++cmd_tick & 15)) {
+		FILE *f = fopen("/dev/shm/luma-test/cmd", "r");
+		if (f) {
+			char k[16];
+			double v;
+			if (fscanf(f, "%15s %lf", k, &v) == 2) {
+				double *t = !strcmp(k, "em") ? &tune.em : !strcmp(k, "lh") ? &tune.lh : !strcmp(k, "side") ? &tune.side : !strcmp(k, "indent") ? &tune.indent : NULL;
+				if (t) {
+					*t = v;
+					panel.dirty = 1;
+					clock_gettime(CLOCK_MONOTONIC, &panel.changed);
+					logf_("отладка: %s = %g", k, v);
+				}
+			}
+			fclose(f);
+			unlink("/dev/shm/luma-test/cmd");
+		}
+	}
 	if (tune_item)
 		item_hook();
 	if (panel.dirty && since_ms(&panel.changed) > 700 && since_ms(&panel.applied) > 2500) {
